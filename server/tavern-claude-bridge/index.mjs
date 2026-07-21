@@ -19,8 +19,6 @@ const MODELS = [
   { id: 'claude-sonnet-5', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-sonnet-4-6', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-haiku-4-5', object: 'model', owned_by: 'anthropic' },
-  { id: 'claude-fable-5', object: 'model', owned_by: 'anthropic' },
-  { id: 'haiku', object: 'model', owned_by: 'anthropic' },
 ];
 
 function parseMessages(messages) {
