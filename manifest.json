@@ -1,0 +1,14 @@
+{
+  "display_name": "Claude Bridge",
+  "loading_order": 100,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Mini AI Team",
+  "version": "1.0.0",
+  "description": "Connect SillyTavern to Claude via official Agent SDK and your own subscription.",
+  "hooks": {
+    "activate": "init"
+  }
+}

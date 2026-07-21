@@ -1,0 +1,90 @@
+.tcb-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 0;
+}
+
+.tcb-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.95em;
+}
+
+.tcb-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.tcb-dot.tcb-on {
+  background: var(--active, #4caf50);
+}
+
+.tcb-dot.tcb-off {
+  background: var(--warning, #ff9800);
+}
+
+.tcb-dot.tcb-warn {
+  background: #f44336;
+}
+
+.tcb-dot.tcb-pending {
+  background: var(--black30a, #999);
+  animation: tcb-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes tcb-pulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+.tcb-info {
+  font-size: 0.9em;
+  white-space: pre-line;
+  color: var(--SmartThemeBodyColor, inherit);
+  opacity: 0.85;
+}
+
+.tcb-models {
+  font-size: 0.9em;
+  color: var(--SmartThemeBodyColor, inherit);
+  opacity: 0.8;
+}
+
+.tcb-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.tcb-guide {
+  font-size: 0.85em;
+  opacity: 0.9;
+}
+
+.tcb-guide summary {
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.tcb-guide ol {
+  padding-left: 1.5em;
+  margin: 6px 0;
+}
+
+.tcb-guide code {
+  background: var(--black30a, rgba(0, 0, 0, 0.1));
+  padding: 2px 5px;
+  border-radius: 3px;
+  font-size: 0.95em;
+  user-select: all;
+}
+
+.tcb-disclaimer {
+  font-size: 0.82em;
+  opacity: 0.7;
+  padding-top: 4px;
+  border-top: 1px solid var(--black30a, rgba(0, 0, 0, 0.1));
+}
