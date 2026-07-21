@@ -13,6 +13,7 @@ let requestCount = 0;
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 
 const MODELS = [
+  { id: 'claude-opus-4-6[1m]', object: 'model', owned_by: 'anthropic' },
   { id: 'sonnet', object: 'model', owned_by: 'anthropic' },
   { id: 'opus', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-fable-5', object: 'model', owned_by: 'anthropic' },
@@ -170,7 +171,7 @@ async function handleChatCompletions(req, res) {
       return;
     }
 
-    const modelId = requestModel || 'sonnet';
+    const modelId = requestModel || 'claude-opus-4-6[1m]';
     const { systemPrompt, prompt } = parseMessages(messages);
     const completionId = `chatcmpl-${randomUUID().slice(0, 8)}`;
 
