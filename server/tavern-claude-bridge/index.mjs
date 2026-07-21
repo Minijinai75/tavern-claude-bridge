@@ -15,6 +15,7 @@ const MAX_BODY_BYTES = 4 * 1024 * 1024;
 const MODELS = [
   { id: 'claude-opus-4-6[1m]', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-opus-4-6', object: 'model', owned_by: 'anthropic' },
+  { id: 'claude-opus-4-8[1m]', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-fable-5', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-sonnet-5', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-sonnet-4-6', object: 'model', owned_by: 'anthropic' },
