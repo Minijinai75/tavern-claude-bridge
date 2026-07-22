@@ -20,7 +20,7 @@
 }
 
 .tcb-dot.tcb-on {
-  background: var(--active, #4caf50);
+  background: #4caf50;
 }
 
 .tcb-dot.tcb-off {

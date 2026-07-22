@@ -180,6 +180,7 @@ async function handleChatCompletions(req, res) {
     if (stream === false) {
       try {
         let fullText = '';
+        let thinkingText = '';
         let costUsd = 0;
         const q = queryFn({
           prompt,
@@ -191,15 +192,16 @@ async function handleChatCompletions(req, res) {
             permissionMode: 'dontAsk',
             persistSession: false,
             settingSources: [],
+            thinking: { type: 'adaptive', display: 'summarized' },
           },
         });
 
         for await (const msg of q) {
           if (msg.type === 'assistant') {
-            fullText += msg.message?.content
-              ?.filter(b => b.type === 'text')
-              .map(b => b.text)
-              .join('') || '';
+            for (const block of msg.message?.content || []) {
+              if (block.type === 'text') fullText += block.text || '';
+              else if (block.type === 'thinking') thinkingText += block.thinking || '';
+            }
           } else if (msg.type === 'result') {
             costUsd = Number(msg.cost_usd) || 0;
           }
@@ -219,7 +221,7 @@ async function handleChatCompletions(req, res) {
           model: modelId,
           choices: [{
             index: 0,
-            message: { role: 'assistant', content: fullText },
+            message: { role: 'assistant', content: fullText, ...(thinkingText && { reasoning_content: thinkingText }) },
             finish_reason: 'stop',
           }],
         };
@@ -264,6 +266,7 @@ async function handleChatCompletions(req, res) {
         persistSession: false,
         includePartialMessages: true,
         settingSources: [],
+        thinking: { type: 'adaptive', display: 'summarized' },
       },
     });
 
@@ -284,6 +287,9 @@ async function handleChatCompletions(req, res) {
           if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
             const textChunk = makeChunk(completionId, modelId, { content: event.delta.text }, null);
             if (!aborted) res.write(`data: ${JSON.stringify(textChunk)}\n\n`);
+          } else if (event.type === 'content_block_delta' && event.delta?.type === 'thinking_delta' && event.delta.thinking) {
+            const thinkChunk = makeChunk(completionId, modelId, { reasoning_content: event.delta.thinking }, null);
+            if (!aborted) res.write(`data: ${JSON.stringify(thinkChunk)}\n\n`);
           }
         } else if (msg.type === 'result') {
           costUsd = Number(msg.cost_usd) || 0;
