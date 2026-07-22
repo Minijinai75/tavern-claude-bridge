@@ -2,6 +2,9 @@ const PLUGIN_ID = 'tavern-claude-bridge';
 const API_BASE = `/api/plugins/${PLUGIN_ID}`;
 const UI_PREFIX = 'tcb';
 const SETTINGS_KEY = 'tavern_claude_bridge';
+const LOCAL_VERSION = '1.0.0';
+const GITHUB_RELEASE_API = 'https://api.github.com/repos/Minijinai75/tavern-claude-bridge/releases/latest';
+let updateCache;
 
 const DEFAULT_SETTINGS = {
   bridgePort: 5199,
@@ -29,6 +32,36 @@ function loadSettings() {
     if (root[SETTINGS_KEY][k] === undefined) root[SETTINGS_KEY][k] = v;
   }
   return root[SETTINGS_KEY];
+}
+
+function isNewer(remote, local) {
+  const r = remote.split('.').map(Number);
+  const l = local.split('.').map(Number);
+  for (let i = 0; i < 3; i++) {
+    if ((r[i] || 0) > (l[i] || 0)) return true;
+    if ((r[i] || 0) < (l[i] || 0)) return false;
+  }
+  return false;
+}
+
+async function checkForUpdate() {
+  if (updateCache !== undefined) return updateCache;
+  try {
+    const res = await fetch(GITHUB_RELEASE_API, {
+      headers: { 'Accept': 'application/vnd.github.v3+json' },
+    });
+    if (!res.ok) { updateCache = null; return null; }
+    const data = await res.json();
+    const latest = (data.tag_name || '').replace(/^v/, '');
+    if (latest && isNewer(latest, LOCAL_VERSION)) {
+      updateCache = { version: latest, url: data.html_url };
+    } else {
+      updateCache = null;
+    }
+  } catch {
+    updateCache = null;
+  }
+  return updateCache;
 }
 
 async function probePlugin() {
@@ -69,6 +102,7 @@ function buildPanel() {
           <span id="${UI_PREFIX}-status-text">偵測中…</span>
         </div>
         <div class="${UI_PREFIX}-info" id="${UI_PREFIX}-info"></div>
+        <div class="${UI_PREFIX}-update" id="${UI_PREFIX}-update"></div>
         <div class="${UI_PREFIX}-models" id="${UI_PREFIX}-models"></div>
         <div class="${UI_PREFIX}-actions">
           <button id="${UI_PREFIX}-refresh" class="menu_button" type="button">
@@ -152,6 +186,19 @@ function buildPanel() {
 
   refreshBtn.addEventListener('click', refresh);
   refresh();
+
+  const updateEl = drawer.querySelector(`#${UI_PREFIX}-update`);
+  checkForUpdate().then(update => {
+    if (!update) return;
+    updateEl.append(`🔔 有新版 v${update.version} — `);
+    const link = document.createElement('a');
+    link.href = update.url;
+    link.target = '_blank';
+    link.rel = 'noopener';
+    link.textContent = '查看更新';
+    updateEl.appendChild(link);
+    updateEl.append('｜重跑 install.ps1 更新');
+  });
 }
 
 export async function init() {
