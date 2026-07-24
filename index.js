@@ -2,7 +2,7 @@ const PLUGIN_ID = 'tavern-claude-bridge';
 const API_BASE = `/api/plugins/${PLUGIN_ID}`;
 const UI_PREFIX = 'tcb';
 const SETTINGS_KEY = 'tavern_claude_bridge';
-const LOCAL_VERSION = '1.1.0';
+const LOCAL_VERSION = '1.1.1';
 const GITHUB_RELEASE_API = 'https://api.github.com/repos/Minijinai75/tavern-claude-bridge/releases/latest';
 let updateCache;
 
@@ -201,24 +201,40 @@ function buildPanel() {
   });
 }
 
+// 酒館「推理耗費」的 auto 沒有對應檔位，落 medium（與 bridge 預設一致）
 const EFFORT_MAP = { min: 'low', low: 'low', medium: 'medium', high: 'high', max: 'max' };
 
-function syncEffort() {
+async function syncEffort() {
   const el = document.getElementById('openai_reasoning_effort');
   if (!el) return;
   const effort = EFFORT_MAP[el.value] || 'medium';
-  const settings = loadSettings();
-  fetch(`http://127.0.0.1:${settings.bridgePort}/config`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ effort }),
-  }).catch(() => {});
+  try {
+    // 走 ST 的 plugin router（同源）——直連 127.0.0.1:5199 會被瀏覽器 CORS 擋掉
+    const res = await fetch(`${API_BASE}/config`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ effort }),
+    });
+    if (!res.ok) console.warn(`[${PLUGIN_ID}] effort 同步失敗：HTTP ${res.status}`);
+  } catch (err) {
+    console.warn(`[${PLUGIN_ID}] effort 同步失敗：`, err);
+  }
 }
 
 export async function init() {
   buildPanel();
   syncEffort();
+
+  // 使用者手動切下拉
   const el = document.getElementById('openai_reasoning_effort');
-  if (el) el.addEventListener('input', syncEffort);
+  if (el) el.addEventListener('change', syncEffort);
+
+  // 換預設檔時酒館是用程式改值，不會觸發 change——另外掛事件補上
+  const ctx = getCtx();
+  const presetChanged = ctx?.eventTypes?.OAI_PRESET_CHANGED_AFTER;
+  if (ctx?.eventSource && presetChanged) {
+    ctx.eventSource.on(presetChanged, syncEffort);
+  }
+
   console.log(`[${PLUGIN_ID}] Frontend initialized.`);
 }

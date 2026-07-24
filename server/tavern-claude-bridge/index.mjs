@@ -16,6 +16,8 @@ const VALID_EFFORTS = ['low', 'medium', 'high', 'max'];
 let configEffort = 'medium';
 
 const MODELS = [
+  { id: 'claude-opus-5[1m]', object: 'model', owned_by: 'anthropic' },
+  { id: 'claude-opus-5', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-opus-4-6[1m]', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-opus-4-6', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-opus-4-8[1m]', object: 'model', owned_by: 'anthropic' },
@@ -410,7 +412,7 @@ const info = {
   id: PLUGIN_ID,
   name: 'Claude Bridge',
   description: 'Bridges SillyTavern to Claude via official Agent SDK and local subscription auth.',
-  version: '1.1.0',
+  version: '1.1.1',
 };
 
 async function init(router) {
@@ -443,6 +445,19 @@ async function init(router) {
         : { running: false },
       sdkAvailable: Boolean(queryFn),
     });
+  });
+
+  // effort 設定走 ST 自己的 router（同源），不走 5199——瀏覽器 CORS 擋跨 port 直連
+  router.get('/config', (_req, res) => {
+    res.json({ effort: configEffort });
+  });
+
+  router.post('/config', (req, res) => {
+    const effort = req.body?.effort;
+    if (effort && VALID_EFFORTS.includes(effort)) {
+      configEffort = effort;
+    }
+    res.json({ effort: configEffort });
   });
 
   console.log(`[${PLUGIN_ID}] Plugin initialized.`);

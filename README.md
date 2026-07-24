@@ -135,6 +135,8 @@ Claude Code 是 Anthropic 的官方命令列工具，你用 Claude 訂閱帳號�
 
 | 模型 ID | 對應 Claude 版本 |
 |---|---|
+| `claude-opus-5[1m]` | Opus 5（1M context） |
+| `claude-opus-5` | Opus 5 |
 | `claude-opus-4-6[1m]` | Opus 4.6（1M context） |
 | `claude-opus-4-6` | Opus 4.6 |
 | `claude-opus-4-8[1m]` | Opus 4.8（1M context） |
