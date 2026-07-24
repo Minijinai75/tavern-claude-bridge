@@ -193,6 +193,7 @@ async function handleChatCompletions(req, res) {
             persistSession: false,
             settingSources: [],
             thinking: { type: 'adaptive', display: 'summarized' },
+            outputConfig: { effort: 'medium' },
           },
         });
 
@@ -267,6 +268,7 @@ async function handleChatCompletions(req, res) {
         includePartialMessages: true,
         settingSources: [],
         thinking: { type: 'adaptive', display: 'summarized' },
+        outputConfig: { effort: 'medium' },
       },
     });
 
