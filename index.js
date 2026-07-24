@@ -201,7 +201,24 @@ function buildPanel() {
   });
 }
 
+const EFFORT_MAP = { min: 'low', low: 'low', medium: 'medium', high: 'high', max: 'max' };
+
+function syncEffort() {
+  const el = document.getElementById('openai_reasoning_effort');
+  if (!el) return;
+  const effort = EFFORT_MAP[el.value] || 'medium';
+  const settings = loadSettings();
+  fetch(`http://127.0.0.1:${settings.bridgePort}/config`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ effort }),
+  }).catch(() => {});
+}
+
 export async function init() {
   buildPanel();
+  syncEffort();
+  const el = document.getElementById('openai_reasoning_effort');
+  if (el) el.addEventListener('input', syncEffort);
   console.log(`[${PLUGIN_ID}] Frontend initialized.`);
 }

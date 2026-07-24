@@ -12,6 +12,9 @@ let totalCostUsd = 0;
 let requestCount = 0;
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 
+const VALID_EFFORTS = ['low', 'medium', 'high', 'max'];
+let configEffort = 'medium';
+
 const MODELS = [
   { id: 'claude-opus-4-6[1m]', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-opus-4-6', object: 'model', owned_by: 'anthropic' },
@@ -193,7 +196,7 @@ async function handleChatCompletions(req, res) {
             persistSession: false,
             settingSources: [],
             thinking: { type: 'adaptive', display: 'summarized' },
-            outputConfig: { effort: 'medium' },
+            outputConfig: { effort: configEffort },
           },
         });
 
@@ -268,7 +271,7 @@ async function handleChatCompletions(req, res) {
         includePartialMessages: true,
         settingSources: [],
         thinking: { type: 'adaptive', display: 'summarized' },
-        outputConfig: { effort: 'medium' },
+        outputConfig: { effort: configEffort },
       },
     });
 
@@ -351,6 +354,27 @@ function startBridge(port) {
         if (req.method === 'GET' && req.url === '/v1/models') {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ object: 'list', data: MODELS }));
+          return;
+        }
+
+        if (req.method === 'GET' && req.url === '/config') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ effort: configEffort }));
+          return;
+        }
+
+        if (req.method === 'POST' && req.url === '/config') {
+          try {
+            const raw = await readBody(req);
+            if (raw) {
+              const cfg = JSON.parse(raw);
+              if (cfg.effort && VALID_EFFORTS.includes(cfg.effort)) {
+                configEffort = cfg.effort;
+              }
+            }
+          } catch {}
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ effort: configEffort }));
           return;
         }
 
