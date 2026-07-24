@@ -410,7 +410,7 @@ const info = {
   id: PLUGIN_ID,
   name: 'Claude Bridge',
   description: 'Bridges SillyTavern to Claude via official Agent SDK and local subscription auth.',
-  version: '1.0.0',
+  version: '1.1.0',
 };
 
 async function init(router) {
