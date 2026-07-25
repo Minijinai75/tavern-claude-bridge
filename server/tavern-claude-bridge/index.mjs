@@ -49,21 +49,41 @@ const MODELS = [
   { id: 'claude-haiku-4-5', object: 'model', owned_by: 'anthropic' },
 ];
 
+// 酒館「傳送內嵌媒體」送的是 OpenAI 格式的 data URL，Claude 要的是 base64 三件組。
+// 只吃 data URL——外部網址一律不下載（bridge 不該替使用者去打別人的伺服器）。
+function toImageBlock(part) {
+  const url = part && part.image_url && part.image_url.url;
+  if (typeof url !== 'string') return null;
+  const m = url.match(/^data:([^;,]+);base64,(.+)$/);
+  if (!m) return null;
+  return { type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } };
+}
+
 function parseMessages(messages) {
   const systemParts = [];
   const chatHistory = [];
 
   for (const msg of messages) {
-    const content = typeof msg.content === 'string'
-      ? msg.content
-      : Array.isArray(msg.content)
-        ? msg.content.map(p => p.text || '').join('')
-        : '';
+    let content = '';
+    const images = [];
+
+    if (typeof msg.content === 'string') {
+      content = msg.content;
+    } else if (Array.isArray(msg.content)) {
+      for (const p of msg.content) {
+        if (p && p.type === 'image_url') {
+          const block = toImageBlock(p);
+          if (block) images.push(block);
+        } else {
+          content += (p && p.text) || '';
+        }
+      }
+    }
 
     if (msg.role === 'system') {
       systemParts.push(content);
     } else {
-      chatHistory.push({ role: msg.role, content });
+      chatHistory.push({ role: msg.role, content, images });
     }
   }
 
@@ -85,7 +105,27 @@ function parseMessages(messages) {
     prompt = `<history>\n${historyText}\n</history>\n\n${lastMsg.content}`;
   }
 
-  return { systemPrompt, prompt };
+  // 只帶最後一則的圖：RP 用法是「丟一張圖→角色對它反應」，
+  // 整段歷史的圖全帶會讓長對話的 token 成本爆掉（26-07-25 Mini 拍板取捨）。
+  const last = chatHistory[chatHistory.length - 1];
+  const images = (last && last.images) || [];
+
+  return { systemPrompt, prompt, images };
+}
+
+// 有圖片時 prompt 不能只是字串——包成串流輸入的單則使用者訊息。
+// 附帶好處：官方註明 interrupt() 只在串流輸入模式可用，走這條讓位才停得乾淨。
+function makeImagePrompt(text, images) {
+  return (async function* () {
+    yield {
+      type: 'user',
+      parent_tool_use_id: null,
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: text || '(empty message)' }, ...images],
+      },
+    };
+  })();
 }
 
 function makeChunk(id, model, delta, finishReason) {
@@ -208,8 +248,11 @@ async function handleChatCompletions(req, res) {
     }
 
     const modelId = requestModel || 'claude-opus-4-6[1m]';
-    const { systemPrompt, prompt } = parseMessages(messages);
+    const { systemPrompt, prompt, images } = parseMessages(messages);
     const completionId = `chatcmpl-${randomUUID().slice(0, 8)}`;
+    // 有圖 → 串流輸入模式（SDK 才收得到 image block）；沒圖 → 維持原本的字串 prompt
+    const hasImages = images.length > 0;
+    const buildPrompt = () => (hasImages ? makeImagePrompt(prompt, images) : prompt);
 
     if (stream === false) {
       try {
@@ -217,7 +260,7 @@ async function handleChatCompletions(req, res) {
         let thinkingText = '';
         let costUsd = 0;
         const q = queryFn({
-          prompt,
+          prompt: buildPrompt(),
           options: {
             systemPrompt,
             tools: [],
@@ -241,6 +284,7 @@ async function handleChatCompletions(req, res) {
             }
           } else if (msg.type === 'result') {
             costUsd = Number(msg.cost_usd) || 0;
+            break; // 串流輸入模式不會自己收尾（SDK 等下一則輸入），拿到 result 就走
           }
         }
 
@@ -249,7 +293,7 @@ async function handleChatCompletions(req, res) {
 
         requestCount++;
         totalCostUsd += costUsd;
-        console.log(`[${PLUGIN_ID}][${requestCount}] model=${modelId} cost=$${costUsd.toFixed(4)} total=$${totalCostUsd.toFixed(4)}${usage ? ` in=${usage.input_tokens} out=${usage.output_tokens}` : ''}`);
+        console.log(`[${PLUGIN_ID}][${requestCount}] model=${modelId} effort=${configEffort}${hasImages ? ` img=${images.length}` : ''} cost=$${costUsd.toFixed(4)} total=$${totalCostUsd.toFixed(4)}${usage ? ` in=${usage.input_tokens} out=${usage.output_tokens}` : ''}`);
 
         const responseBody = {
           id: completionId,
@@ -292,7 +336,7 @@ async function handleChatCompletions(req, res) {
     res.write(`data: ${JSON.stringify(roleChunk)}\n\n`);
 
     const q = queryFn({
-      prompt,
+      prompt: buildPrompt(),
       options: {
         systemPrompt,
         tools: [],
@@ -324,6 +368,7 @@ async function handleChatCompletions(req, res) {
           }
         } else if (msg.type === 'result') {
           costUsd = Number(msg.cost_usd) || 0;
+          break; // 串流輸入模式不會自己收尾，拿到 result 就走
         }
       }
 
@@ -332,7 +377,7 @@ async function handleChatCompletions(req, res) {
 
       requestCount++;
       totalCostUsd += costUsd;
-      console.log(`[${PLUGIN_ID}][${requestCount}] model=${modelId} effort=${configEffort} cost=$${costUsd.toFixed(4)} total=$${totalCostUsd.toFixed(4)}${usage ? ` in=${usage.input_tokens} out=${usage.output_tokens}` : ''}${ticket.aborted ? ' (讓位/斷線)' : ''}`);
+      console.log(`[${PLUGIN_ID}][${requestCount}] model=${modelId} effort=${configEffort}${hasImages ? ` img=${images.length}` : ''} cost=$${costUsd.toFixed(4)} total=$${totalCostUsd.toFixed(4)}${usage ? ` in=${usage.input_tokens} out=${usage.output_tokens}` : ''}${ticket.aborted ? ' (讓位/斷線)' : ''}`);
 
       if (!ticket.aborted) {
         const stopChunk = makeChunk(completionId, modelId, {}, 'stop');
@@ -437,7 +482,7 @@ const info = {
   id: PLUGIN_ID,
   name: 'Claude Bridge',
   description: 'Bridges SillyTavern to Claude via official Agent SDK and local subscription auth.',
-  version: '1.1.1',
+  version: '1.1.2',
 };
 
 async function init(router) {
