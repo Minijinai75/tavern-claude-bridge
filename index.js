@@ -201,13 +201,13 @@ function buildPanel() {
   });
 }
 
-// 酒館「推理耗費」的 auto 沒有對應檔位，落 medium（與 bridge 預設一致）
-const EFFORT_MAP = { min: 'low', low: 'low', medium: 'medium', high: 'high', max: 'max' };
+// Auto＝照酒館原生語義「不傳送推理耗費等級」，交給模型自己拿捏（思考本身不受影響，仍是開的）
+const EFFORT_MAP = { auto: 'auto', min: 'low', low: 'low', medium: 'medium', high: 'high', max: 'max' };
 
 async function syncEffort() {
   const el = document.getElementById('openai_reasoning_effort');
   if (!el) return;
-  const effort = EFFORT_MAP[el.value] || 'medium';
+  const effort = EFFORT_MAP[el.value] || 'auto';
   try {
     // 走 ST 的 plugin router（同源）——直連 127.0.0.1:5199 會被瀏覽器 CORS 擋掉
     const res = await fetch(`${API_BASE}/config`, {

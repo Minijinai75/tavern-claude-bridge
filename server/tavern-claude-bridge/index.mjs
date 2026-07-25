@@ -7,13 +7,35 @@ const HOST = '127.0.0.1';
 
 let bridgeServer = null;
 let queryFn = null;
-let busy = false;
+let current = null; // 正在跑的那一則；新請求進來會請它讓位
 let totalCostUsd = 0;
 let requestCount = 0;
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 
-const VALID_EFFORTS = ['low', 'medium', 'high', 'max'];
-let configEffort = 'medium';
+// 讓前一則停下來。26-07-25 改：原本「同時只准一個、後來的回 429」，
+// 在 RP 場景是錯的——玩家按重新生成/停止時，想要的是「換一則」不是「排隊」，
+// 而酒館超時斷線後舊的還在跑，重試就一直吃 429（Mini 26-07-25 實際踩到）。
+// interrupt() 官方註明只在串流輸入模式可用（我們是單次字串輸入），所以兩段式：
+// 先試 interrupt、退而求其次 return()，都失敗就靠 aborted 旗標讓迴圈自己收。
+async function releaseCurrent(reason) {
+  const prev = current;
+  if (!prev) return;
+  current = null;
+  prev.aborted = true;
+  try { await prev.q?.interrupt?.(); } catch {}
+  try { await prev.q?.return?.(); } catch {}
+  console.log(`[${PLUGIN_ID}] 前一則讓位（${reason}）`);
+}
+
+// 'auto'＝完全不送 effort，交給 SDK 的 adaptive 自己決定。
+// 酒館對這個選項的原生說明就是「選擇 Auto 不會傳送推理耗費等級」，照它的語義做；
+// 預設也改回 auto——26-07-24 硬寫 medium 那版沒得選，Mini 只能吃我們替她決定的檔位。
+const VALID_EFFORTS = ['auto', 'low', 'medium', 'high', 'max'];
+let configEffort = 'auto';
+
+function effortOption() {
+  return configEffort === 'auto' ? {} : { outputConfig: { effort: configEffort } };
+}
 
 const MODELS = [
   { id: 'claude-opus-5[1m]', object: 'model', owned_by: 'anthropic' },
@@ -130,18 +152,25 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  if (busy) {
-    res.writeHead(429, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      error: {
-        message: '正在處理其他請求，一次只能一個。稍後再試。',
-        type: 'rate_limit',
-      },
-    }));
-    return;
-  }
+  // 新的一則進來＝玩家要這一則，前一則直接讓位（不再回 429 把人擋在門外）
+  await releaseCurrent('新請求進來');
 
-  busy = true;
+  const ticket = { q: null, aborted: false };
+  current = ticket;
+
+  // 酒館斷線（超時、按停止、關頁面）→ 立刻放手，別讓下一則卡在門口
+  let finished = false;
+  res.on('close', () => {
+    if (finished || ticket.aborted) return;
+    ticket.aborted = true;
+    Promise.resolve()
+      .then(() => ticket.q?.interrupt?.())
+      .catch(() => {})
+      .then(() => ticket.q?.return?.())
+      .catch(() => {});
+    console.log(`[${PLUGIN_ID}] 酒館端斷線，停止生成。`);
+  });
+
   try {
     let body;
     try {
@@ -198,11 +227,13 @@ async function handleChatCompletions(req, res) {
             persistSession: false,
             settingSources: [],
             thinking: { type: 'adaptive', display: 'summarized' },
-            outputConfig: { effort: configEffort },
+            ...effortOption(),
           },
         });
+        ticket.q = q;
 
         for await (const msg of q) {
+          if (ticket.aborted) break;
           if (msg.type === 'assistant') {
             for (const block of msg.message?.content || []) {
               if (block.type === 'text') fullText += block.text || '';
@@ -260,7 +291,6 @@ async function handleChatCompletions(req, res) {
     const roleChunk = makeChunk(completionId, modelId, { role: 'assistant', content: '' }, null);
     res.write(`data: ${JSON.stringify(roleChunk)}\n\n`);
 
-    let aborted = false;
     const q = queryFn({
       prompt,
       options: {
@@ -273,30 +303,24 @@ async function handleChatCompletions(req, res) {
         includePartialMessages: true,
         settingSources: [],
         thinking: { type: 'adaptive', display: 'summarized' },
-        outputConfig: { effort: configEffort },
+        ...effortOption(),
       },
     });
-
-    res.on('close', () => {
-      if (!aborted) {
-        aborted = true;
-        q.return?.();
-        console.log(`[${PLUGIN_ID}] Client disconnected, aborting generation.`);
-      }
-    });
+    ticket.q = q;
+    // 斷線／讓位的處理統一在函式開頭那個 res.on('close') 與 releaseCurrent()，這裡不再另掛
 
     try {
       let costUsd = 0;
       for await (const msg of q) {
-        if (aborted) break;
+        if (ticket.aborted) break;
         if (msg.type === 'stream_event') {
           const event = msg.event;
           if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
             const textChunk = makeChunk(completionId, modelId, { content: event.delta.text }, null);
-            if (!aborted) res.write(`data: ${JSON.stringify(textChunk)}\n\n`);
+            if (!ticket.aborted) res.write(`data: ${JSON.stringify(textChunk)}\n\n`);
           } else if (event.type === 'content_block_delta' && event.delta?.type === 'thinking_delta' && event.delta.thinking) {
             const thinkChunk = makeChunk(completionId, modelId, { reasoning_content: event.delta.thinking }, null);
-            if (!aborted) res.write(`data: ${JSON.stringify(thinkChunk)}\n\n`);
+            if (!ticket.aborted) res.write(`data: ${JSON.stringify(thinkChunk)}\n\n`);
           }
         } else if (msg.type === 'result') {
           costUsd = Number(msg.cost_usd) || 0;
@@ -308,16 +332,16 @@ async function handleChatCompletions(req, res) {
 
       requestCount++;
       totalCostUsd += costUsd;
-      console.log(`[${PLUGIN_ID}][${requestCount}] model=${modelId} cost=$${costUsd.toFixed(4)} total=$${totalCostUsd.toFixed(4)}${usage ? ` in=${usage.input_tokens} out=${usage.output_tokens}` : ''}${aborted ? ' (aborted)' : ''}`);
+      console.log(`[${PLUGIN_ID}][${requestCount}] model=${modelId} effort=${configEffort} cost=$${costUsd.toFixed(4)} total=$${totalCostUsd.toFixed(4)}${usage ? ` in=${usage.input_tokens} out=${usage.output_tokens}` : ''}${ticket.aborted ? ' (讓位/斷線)' : ''}`);
 
-      if (!aborted) {
+      if (!ticket.aborted) {
         const stopChunk = makeChunk(completionId, modelId, {}, 'stop');
         res.write(`data: ${JSON.stringify(stopChunk)}\n\n`);
         res.write('data: [DONE]\n\n');
         res.end();
       }
     } catch (err) {
-      if (!aborted) {
+      if (!ticket.aborted) {
         const errChunk = makeChunk(completionId, modelId, { content: `\n\n[${humanError(err)}]` }, 'stop');
         res.write(`data: ${JSON.stringify(errChunk)}\n\n`);
         res.write('data: [DONE]\n\n');
@@ -330,7 +354,8 @@ async function handleChatCompletions(req, res) {
       res.end(JSON.stringify({ error: { message: humanError(err), type: 'server_error' } }));
     }
   } finally {
-    busy = false;
+    finished = true;
+    if (current === ticket) current = null; // 已經讓位給新的一則就別誤清人家的位子
   }
 }
 
@@ -349,7 +374,7 @@ function startBridge(port) {
 
         if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ status: 'ok', busy, requestCount, totalCostUsd }));
+          res.end(JSON.stringify({ status: 'ok', busy: current !== null, effort: configEffort, requestCount, totalCostUsd }));
           return;
         }
 
@@ -441,7 +466,7 @@ async function init(router) {
       plugin: PLUGIN_ID,
       version: info.version,
       bridge: bridgeServer
-        ? { running: true, host: HOST, port: DEFAULT_PORT, busy, requestCount, totalCostUsd, models: MODELS.map(m => m.id) }
+        ? { running: true, host: HOST, port: DEFAULT_PORT, busy: current !== null, effort: configEffort, requestCount, totalCostUsd, models: MODELS.map(m => m.id) }
         : { running: false },
       sdkAvailable: Boolean(queryFn),
     });
