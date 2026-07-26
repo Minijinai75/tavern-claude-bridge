@@ -249,6 +249,11 @@ async function handleChatCompletions(req, res) {
 
     const modelId = requestModel || 'claude-opus-4-6[1m]';
     const { systemPrompt, prompt, images } = parseMessages(messages);
+    // 請求形狀進 log：sys=0字/0則 一眼看出「角色卡沒送到」——酒館端把 system 拆掉時
+    // （提示詞後處理選半嚴格/嚴格會把首則以外的 system 改成 user）症狀是模型跳出角色拒答，
+    // 沒有這行就只能靠臨時插碼才診斷得出來（26-07-27 實案）。長度而已，不印內容。
+    const sysCount = messages.filter(m => m && m.role === 'system').length;
+    const shape = `sys=${systemPrompt ? systemPrompt.length : 0}字/${sysCount}則 msgs=${messages.length}`;
     const completionId = `chatcmpl-${randomUUID().slice(0, 8)}`;
     // 有圖 → 串流輸入模式（SDK 才收得到 image block）；沒圖 → 維持原本的字串 prompt
     const hasImages = images.length > 0;
@@ -293,7 +298,7 @@ async function handleChatCompletions(req, res) {
 
         requestCount++;
         totalCostUsd += costUsd;
-        console.log(`[${PLUGIN_ID}][${requestCount}] model=${modelId} effort=${configEffort}${hasImages ? ` img=${images.length}` : ''} cost=$${costUsd.toFixed(4)} total=$${totalCostUsd.toFixed(4)}${usage ? ` in=${usage.input_tokens} out=${usage.output_tokens}` : ''}`);
+        console.log(`[${PLUGIN_ID}][${requestCount}] model=${modelId} effort=${configEffort} ${shape}${hasImages ? ` img=${images.length}` : ''} cost=$${costUsd.toFixed(4)} total=$${totalCostUsd.toFixed(4)}${usage ? ` in=${usage.input_tokens} out=${usage.output_tokens}` : ' usage=n/a'}`);
 
         const responseBody = {
           id: completionId,
@@ -377,7 +382,7 @@ async function handleChatCompletions(req, res) {
 
       requestCount++;
       totalCostUsd += costUsd;
-      console.log(`[${PLUGIN_ID}][${requestCount}] model=${modelId} effort=${configEffort}${hasImages ? ` img=${images.length}` : ''} cost=$${costUsd.toFixed(4)} total=$${totalCostUsd.toFixed(4)}${usage ? ` in=${usage.input_tokens} out=${usage.output_tokens}` : ''}${ticket.aborted ? ' (讓位/斷線)' : ''}`);
+      console.log(`[${PLUGIN_ID}][${requestCount}] model=${modelId} effort=${configEffort} ${shape}${hasImages ? ` img=${images.length}` : ''} cost=$${costUsd.toFixed(4)} total=$${totalCostUsd.toFixed(4)}${usage ? ` in=${usage.input_tokens} out=${usage.output_tokens}` : ' usage=n/a'}${ticket.aborted ? ' (讓位/斷線)' : ''}`);
 
       if (!ticket.aborted) {
         const stopChunk = makeChunk(completionId, modelId, {}, 'stop');
@@ -482,7 +487,7 @@ const info = {
   id: PLUGIN_ID,
   name: 'Claude Bridge',
   description: 'Bridges SillyTavern to Claude via official Agent SDK and local subscription auth.',
-  version: '1.1.2',
+  version: '1.1.3',
 };
 
 async function init(router) {
