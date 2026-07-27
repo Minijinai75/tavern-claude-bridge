@@ -105,3 +105,20 @@
   padding-top: 4px;
   border-top: 1px solid var(--black30a, rgba(0, 0, 0, 0.1));
 }
+
+.tcb-option {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tcb-option small {
+  font-size: 0.8em;
+  opacity: 0.7;
+  line-height: 1.4;
+}
+
+.tcb-option code {
+  font-size: 0.95em;
+  padding: 0 2px;
+}

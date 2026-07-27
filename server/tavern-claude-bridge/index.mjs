@@ -37,6 +37,20 @@ function effortOption() {
   return configEffort === 'auto' ? {} : { outputConfig: { effort: configEffort } };
 }
 
+// SDK 原生思考摘要（26-07-27 加開關，霽野裁定預設關）。
+// 病理（霽野讀 jsonl 實證）：思考只有 SDK thinking block 一條通道，開著的時候，
+// 預設要求的中文思考鏈**有時搶到、有時被模型原生英文腦蓋掉**，而正文的 `<thinking>`
+// 只剩空標籤——預設設計的位置被架空，這才是中英不穩的真因，不是「兩股並跑」。
+// 關掉＝把思考鏈趕回 prompt 管得住的正文層，酒館照樣解析得到、使用者照樣看得見。
+// 順帶解掉「該輪只生 thinking block、沒生 text block → 回空字串」的空回覆。
+// 預設關的理由：現役使用者 100% 用帶思考鏈的預設，這股對他們是冗餘＋燒 token；
+// 素卡使用者想要原生摘要再自己打開。
+let configThinking = false;
+
+function thinkingOption() {
+  return configThinking ? { thinking: { type: 'adaptive', display: 'summarized' } } : {};
+}
+
 const MODELS = [
   { id: 'claude-opus-5[1m]', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-opus-5', object: 'model', owned_by: 'anthropic' },
@@ -59,11 +73,28 @@ function toImageBlock(part) {
   return { type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } };
 }
 
+function renderTurn(m) {
+  const tag = m.role === 'user' ? 'user' : (m.role === 'system' ? 'system' : 'reply');
+  return `<${tag}>\n${m.content}\n</${tag}>`;
+}
+
+// 位置語義（26-07-27 大修，霽野裁定①）：
+// 舊版把所有 role=system 不分位置一律搬進系統提示的最前面。酒館的注入是**帶位置的**——
+// 世界書 depth、作者註記、post-history 指令都靠位置生效，全部搬到最前面等於改寫了酒館的語義。
+// 實案：綾（外部使用者）94 則 system 有 93 則穿插在對話中間、最後一則也是 system，
+// 症狀＝不照格式輸出；Mini 側同病輕度（她 5 條 depth 注入裡的「導演指令 depth=1」被搬位，
+// 病徵是模型在思考裡手工重建該判定，霽野讀 jsonl 抓到現場）。
+//
+// 現行規則只有一條：**開頭連續的 system 才是系統提示；第一則非 system 出現之後的
+// 每一則 system，都留在它原本的位置。** bridge 是橋，不是編輯。
 function parseMessages(messages) {
-  const systemParts = [];
-  const chatHistory = [];
+  const systemParts = [];   // 開頭連續的 system（角色卡、預設前段）
+  const flow = [];          // 第一則非 system 之後的所有訊息，含 system，原序不動
+  let headerDone = false;
 
   for (const msg of messages) {
+    if (!msg) continue;     // 陣列含 null 不炸（澄衡 26-07-21 低危同族）
+
     let content = '';
     const images = [];
 
@@ -80,35 +111,46 @@ function parseMessages(messages) {
       }
     }
 
-    if (msg.role === 'system') {
+    if (msg.role === 'system' && !headerDone) {
       systemParts.push(content);
-    } else {
-      chatHistory.push({ role: msg.role, content, images });
+      continue;
     }
+    if (msg.role !== 'system') headerDone = true;
+    flow.push({ role: msg.role, content, images });
   }
 
   const systemPrompt = systemParts.join('\n\n') || undefined;
 
-  let prompt;
-  if (chatHistory.length === 0) {
-    prompt = '(empty message)';
-  } else if (chatHistory.length === 1) {
-    prompt = chatHistory[0].content;
-  } else {
-    const lastMsg = chatHistory[chatHistory.length - 1];
-    const history = chatHistory.slice(0, -1);
-    const historyText = history.map(m => {
-      const tag = m.role === 'user' ? 'user' : 'reply';
-      return `<${tag}>\n${m.content}\n</${tag}>`;
-    }).join('\n');
-
-    prompt = `<history>\n${historyText}\n</history>\n\n${lastMsg.content}`;
+  // 當前訊息取「最後一則 **user**」，不是「最後一則」——depth=0 的注入會排在玩家發言之後，
+  // 舊版直接把它當成玩家現在說的話送出去（綾案：最後一則是 MVU 規則）。
+  let curIdx = -1;
+  for (let i = flow.length - 1; i >= 0; i--) {
+    if (flow[i].role === 'user') { curIdx = i; break; }
   }
 
-  // 只帶最後一則的圖：RP 用法是「丟一張圖→角色對它反應」，
-  // 整段歷史的圖全帶會讓長對話的 token 成本爆掉（26-07-25 Mini 拍板取捨）。
-  const last = chatHistory[chatHistory.length - 1];
-  const images = (last && last.images) || [];
+  let prompt;
+  let images = [];
+
+  if (flow.length === 0) {
+    prompt = '(empty message)';
+  } else if (curIdx === -1) {
+    // 沒有任何 user（例如只有角色開場白）——整段照原序給，不硬挑一則當「當前」
+    prompt = flow.map(renderTurn).join('\n');
+  } else {
+    const before = flow.slice(0, curIdx);
+    const cur = flow[curIdx];
+    const after = flow.slice(curIdx + 1);   // post-history：位置就是它的效力
+
+    // 只帶最後一則 user 的圖：RP 用法是「丟一張圖→角色對它反應」，
+    // 整段歷史的圖全帶會讓長對話的 token 成本爆掉（26-07-25 Mini 拍板取捨）。
+    images = cur.images || [];
+
+    const parts = [];
+    if (before.length) parts.push(`<history>\n${before.map(renderTurn).join('\n')}\n</history>`);
+    parts.push(cur.content);
+    if (after.length) parts.push(after.map(renderTurn).join('\n'));
+    prompt = parts.join('\n\n');
+  }
 
   return { systemPrompt, prompt, images };
 }
@@ -274,7 +316,7 @@ async function handleChatCompletions(req, res) {
             permissionMode: 'dontAsk',
             persistSession: false,
             settingSources: [],
-            thinking: { type: 'adaptive', display: 'summarized' },
+            ...thinkingOption(),
             ...effortOption(),
           },
         });
@@ -351,7 +393,7 @@ async function handleChatCompletions(req, res) {
         persistSession: false,
         includePartialMessages: true,
         settingSources: [],
-        thinking: { type: 'adaptive', display: 'summarized' },
+        ...thinkingOption(),
         ...effortOption(),
       },
     });
@@ -436,7 +478,7 @@ function startBridge(port) {
 
         if (req.method === 'GET' && req.url === '/config') {
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ effort: configEffort }));
+          res.end(JSON.stringify({ effort: configEffort, thinking: configThinking }));
           return;
         }
 
@@ -448,10 +490,13 @@ function startBridge(port) {
               if (cfg.effort && VALID_EFFORTS.includes(cfg.effort)) {
                 configEffort = cfg.effort;
               }
+              if (typeof cfg.thinking === 'boolean') {
+                configThinking = cfg.thinking;
+              }
             }
           } catch {}
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ effort: configEffort }));
+          res.end(JSON.stringify({ effort: configEffort, thinking: configThinking }));
           return;
         }
 
@@ -487,7 +532,7 @@ const info = {
   id: PLUGIN_ID,
   name: 'Claude Bridge',
   description: 'Bridges SillyTavern to Claude via official Agent SDK and local subscription auth.',
-  version: '1.1.3',
+  version: '1.2.0',
 };
 
 async function init(router) {
@@ -524,7 +569,7 @@ async function init(router) {
 
   // effort 設定走 ST 自己的 router（同源），不走 5199——瀏覽器 CORS 擋跨 port 直連
   router.get('/config', (_req, res) => {
-    res.json({ effort: configEffort });
+    res.json({ effort: configEffort, thinking: configThinking });
   });
 
   router.post('/config', (req, res) => {
@@ -532,7 +577,10 @@ async function init(router) {
     if (effort && VALID_EFFORTS.includes(effort)) {
       configEffort = effort;
     }
-    res.json({ effort: configEffort });
+    if (typeof req.body?.thinking === 'boolean') {
+      configThinking = req.body.thinking;
+    }
+    res.json({ effort: configEffort, thinking: configThinking });
   });
 
   console.log(`[${PLUGIN_ID}] Plugin initialized.`);
@@ -546,4 +594,7 @@ async function exit() {
   }
 }
 
-export { info, init, exit };
+// parseMessages 與 thinkingOption 一併匯出供測試直接呼叫真函式
+//（ST 只讀 info/init/exit，多兩個具名匯出對它無影響）。
+// 位置語義與思考開關是這支橋最容易壞又最看不出來的兩處，測試必須測到本尊、不是抄一份副本。
+export { info, init, exit, parseMessages, thinkingOption };

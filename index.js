@@ -2,12 +2,15 @@ const PLUGIN_ID = 'tavern-claude-bridge';
 const API_BASE = `/api/plugins/${PLUGIN_ID}`;
 const UI_PREFIX = 'tcb';
 const SETTINGS_KEY = 'tavern_claude_bridge';
-const LOCAL_VERSION = '1.1.3';
+const LOCAL_VERSION = '1.2.0';
 const GITHUB_RELEASE_API = 'https://api.github.com/repos/Minijinai75/tavern-claude-bridge/releases/latest';
 let updateCache;
 
 const DEFAULT_SETTINGS = {
   bridgePort: 5199,
+  // Claude 原生思考摘要。預設關——詳細理由見 server 端 thinkingOption() 上方註解，
+  // 簡版：它跟預設自己的 <thinking> 思考鏈搶同一條通道，開著反而讓思考中英不穩。
+  sdkThinking: false,
 };
 
 function getCtx() {
@@ -104,6 +107,13 @@ function buildPanel() {
         <div class="${UI_PREFIX}-info" id="${UI_PREFIX}-info"></div>
         <div class="${UI_PREFIX}-update" id="${UI_PREFIX}-update"></div>
         <div class="${UI_PREFIX}-models" id="${UI_PREFIX}-models"></div>
+        <div class="${UI_PREFIX}-option">
+          <label class="checkbox_label">
+            <input type="checkbox" id="${UI_PREFIX}-thinking">
+            <span>使用 Claude 原生思考摘要</span>
+          </label>
+          <small>預設關閉。你的預設如果自己會要求角色輸出思考（例如正文開頭的 <code>&lt;thinking&gt;</code> 區塊），請保持關閉——兩者會搶同一條通道，開著會讓思考變成中英混雜、偶爾整輪空白回覆。用素卡、想看 Claude 自己的推理摘要再打開。</small>
+        </div>
         <div class="${UI_PREFIX}-actions">
           <button id="${UI_PREFIX}-refresh" class="menu_button" type="button">
             <i class="fa-solid fa-rotate"></i> 重新偵測
@@ -134,6 +144,16 @@ function buildPanel() {
   const infoEl = drawer.querySelector(`#${UI_PREFIX}-info`);
   const modelsEl = drawer.querySelector(`#${UI_PREFIX}-models`);
   const refreshBtn = drawer.querySelector(`#${UI_PREFIX}-refresh`);
+  const thinkingEl = drawer.querySelector(`#${UI_PREFIX}-thinking`);
+
+  if (thinkingEl) {
+    thinkingEl.checked = !!settings.sdkThinking;
+    thinkingEl.addEventListener('change', () => {
+      settings.sdkThinking = thinkingEl.checked;
+      getCtx()?.saveSettingsDebounced?.();
+      syncConfig();
+    });
+  }
 
   async function refresh() {
     statusTextEl.textContent = '偵測中…';
@@ -204,36 +224,39 @@ function buildPanel() {
 // Auto＝照酒館原生語義「不傳送推理耗費等級」，交給模型自己拿捏（思考本身不受影響，仍是開的）
 const EFFORT_MAP = { auto: 'auto', min: 'low', low: 'low', medium: 'medium', high: 'high', max: 'max' };
 
-async function syncEffort() {
+// 一次送齊整份設定（effort＋原生思考開關）。26-07-27 從 syncEffort 擴寫：
+// 後端的設定是記憶體變數、重啟即回預設，所以每次前端有動作就把整份現況推過去，
+// 不做「只推有變的那個」——省不了多少，卻會讓兩邊在重啟後靜靜地不一致。
+async function syncConfig() {
   const el = document.getElementById('openai_reasoning_effort');
-  if (!el) return;
-  const effort = EFFORT_MAP[el.value] || 'auto';
+  const effort = el ? (EFFORT_MAP[el.value] || 'auto') : 'auto';
+  const settings = loadSettings();
   try {
     // 走 ST 的 plugin router（同源）——直連 127.0.0.1:5199 會被瀏覽器 CORS 擋掉
     const res = await fetch(`${API_BASE}/config`, {
       method: 'POST',
       headers: getHeaders(),
-      body: JSON.stringify({ effort }),
+      body: JSON.stringify({ effort, thinking: !!settings.sdkThinking }),
     });
-    if (!res.ok) console.warn(`[${PLUGIN_ID}] effort 同步失敗：HTTP ${res.status}`);
+    if (!res.ok) console.warn(`[${PLUGIN_ID}] 設定同步失敗：HTTP ${res.status}`);
   } catch (err) {
-    console.warn(`[${PLUGIN_ID}] effort 同步失敗：`, err);
+    console.warn(`[${PLUGIN_ID}] 設定同步失敗：`, err);
   }
 }
 
 export async function init() {
   buildPanel();
-  syncEffort();
+  syncConfig();
 
   // 使用者手動切下拉
   const el = document.getElementById('openai_reasoning_effort');
-  if (el) el.addEventListener('change', syncEffort);
+  if (el) el.addEventListener('change', syncConfig);
 
   // 換預設檔時酒館是用程式改值，不會觸發 change——另外掛事件補上
   const ctx = getCtx();
   const presetChanged = ctx?.eventTypes?.OAI_PRESET_CHANGED_AFTER;
   if (ctx?.eventSource && presetChanged) {
-    ctx.eventSource.on(presetChanged, syncEffort);
+    ctx.eventSource.on(presetChanged, syncConfig);
   }
 
   console.log(`[${PLUGIN_ID}] Frontend initialized.`);
