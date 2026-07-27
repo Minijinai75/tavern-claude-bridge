@@ -109,15 +109,65 @@ function renderTurn(m) {
 // 症狀＝不照格式輸出；Mini 側同病輕度（她 5 條 depth 注入裡的「導演指令 depth=1」被搬位，
 // 病徵是模型在思考裡手工重建該判定，霽野讀 jsonl 抓到現場）。
 //
-// 現行規則只有一條：**開頭連續的 system 才是系統提示；第一則非 system 出現之後的
-// 每一則 system，都留在它原本的位置。** bridge 是橋，不是編輯。
+// 核心規則：**header 區才是系統提示；對話開始之後的每一則 system 都留在它原本的位置。**
+// bridge 是橋，不是編輯。「header 到哪裡為止」的判準見下方兩段式說明。
+//
+// ── header 到哪裡為止：兩段式判準（26-07-27 第三版，綾兩份驗收報告逼出來的）──
+//
+// 判準一（嚴格，預設走這條）：開頭連續的 system，空白佔位訊息跳過不算數。
+//   涵蓋絕大多數預設。正常對話 `system…, user(第一句), assistant(回應)…` 完全正確。
+//
+// 判準二（救援，只在判準一拼不出系統提示卻確實有 system 訊息時啟用）：
+//   第一則 assistant 之前全歸 header。
+//   為什麼需要它：綾的預設把 `[PERSONA·STORYTELLER]` 和 `---` **指定為 user 角色**
+//   排在最前面（有實質內容，判準一在 index 0 就結束），結果 94 則 system 全落進
+//   對話流、系統提示是空的。她的 header 區長達 41 則且完全沒有 assistant——
+//   「角色說過話才代表對話開始了」在這種形狀下是可靠訊號。
+//
+// 為什麼不無條件用判準二：一般對話的第一則 assistant 前面那個 user 是**玩家的第一句話**，
+//   無條件套用會把它吃進系統提示（實測打掉 7 組既有案例）。兩者無法用結構分辨，
+//   所以只在判準一確實失敗時才啟用救援，不拿正常情況去賭。
+//
+// 判準二的失效情形（綾自己指出）：整份沒有 assistant 時會吃掉玩家那句 → 退到
+//   「最後一則 user 之前」保住它。
+function strictHeaderEnd(messages) {
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (!m) continue;
+    if (m.role === 'system') continue;
+    const c = typeof m.content === 'string' ? m.content : '';
+    const isBlank = c.trim() === '' && !(Array.isArray(m.content) && m.content.some(p => p?.type === 'image_url'));
+    if (isBlank) continue;      // 空白佔位不算對話開始
+    return i;
+  }
+  return messages.length;
+}
+
+function rescueHeaderEnd(messages) {
+  const firstAssistant = messages.findIndex(m => m && m.role === 'assistant');
+  if (firstAssistant >= 0) return firstAssistant;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i] && messages[i].role === 'user') return i;   // 保住當前訊息
+  }
+  return messages.length;
+}
+
 function parseMessages(messages) {
-  const systemParts = [];   // 開頭連續的 system（角色卡、預設前段）
-  const flow = [];          // 第一則非 system 之後的所有訊息，含 system，原序不動
+  const strict = parseWithHeaderEnd(messages, strictHeaderEnd(messages));
+  if (strict.systemPrompt || !messages.some(m => m && m.role === 'system')) return strict;
+  // 判準一失敗且確實有 system → 啟用救援
+  return parseWithHeaderEnd(messages, rescueHeaderEnd(messages));
+}
+
+function parseWithHeaderEnd(messages, headerEnd) {
+  const systemParts = [];   // header 區：角色卡、預設前段（含被標成 user 的指令區塊）
+  const flow = [];          // 對話流：原序不動，含 depth 注入與 post-history
   let headerDone = false;
 
-  for (const msg of messages) {
+  for (let idx = 0; idx < messages.length; idx++) {
+    const msg = messages[idx];
     if (!msg) continue;     // 陣列含 null 不炸（澄衡 26-07-21 低危同族）
+    if (idx >= headerEnd) headerDone = true;
 
     let content = '';
     const images = [];
@@ -140,18 +190,13 @@ function parseMessages(messages) {
       console.warn(`[${PLUGIN_ID}] 非預期的 content 型別（${typeof msg.content}），已轉字串處理`);
     }
 
-    if (msg.role === 'system' && !headerDone) {
+    // header 區：不管 role 是 system 還是 user 都併進系統提示——
+    // 那些是指令不是對話，酒館把它們標成 user 只是格式選擇（綾的預設實況）。
+    if (!headerDone) {
       systemParts.push(content);
       continue;
     }
 
-    // header 階段的空白訊息＝佔位符，跳過不算數（26-07-27 綾案退步修復）。
-    // 她的序列是 user(空),system×4,user,... —— 舊規則在第一則就判定 header 結束，
-    // 94 則 system 全落進對話流、systemPrompt=undefined，角色卡一個字都沒進系統提示。
-    // 分界的正確定義是「第一則**有實質內容**的非 system 訊息」，不是「第一則非 system」。
-    if (!headerDone && content.trim() === '' && images.length === 0) continue;
-
-    if (msg.role !== 'system') headerDone = true;
     flow.push({ role: msg.role, content, images });
   }
 
@@ -612,7 +657,7 @@ const info = {
   id: PLUGIN_ID,
   name: 'Claude Bridge',
   description: 'Bridges SillyTavern to Claude via official Agent SDK and local subscription auth.',
-  version: '1.2.2',
+  version: '1.2.3',
 };
 
 async function init(router) {
