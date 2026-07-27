@@ -720,6 +720,9 @@ async function exit() {
 }
 
 // parseMessages 與 thinkingOption 一併匯出供測試直接呼叫真函式
-//（ST 只讀 info/init/exit，多兩個具名匯出對它無影響）。
+//（ST 只讀 info/init/exit，多幾個具名匯出對它無影響）。
 // 位置語義與思考開關是這支橋最容易壞又最看不出來的兩處，測試必須測到本尊、不是抄一份副本。
-export { info, init, exit, parseMessages, thinkingOption };
+// _setQueryFn 僅供測試：把 SDK 的 query 換成假的，讓契約測試驗「送進 SDK 的 options」與
+// 「thinking block 關閉時不回酒館」的完整請求鏈（Grok MED-5），不必實彈也不佔真額度。
+function _setQueryFn(fn) { queryFn = fn; }
+export { info, init, exit, parseMessages, thinkingOption, handleChatCompletions, _setQueryFn };
