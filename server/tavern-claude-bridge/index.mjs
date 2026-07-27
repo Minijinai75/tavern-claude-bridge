@@ -47,8 +47,15 @@ function effortOption() {
 // 素卡使用者想要原生摘要再自己打開。
 let configThinking = false;
 
+// 26-07-27 退修（霽野實彈驗收 FAIL）：**不送參數 ≠ 關閉**。
+// SDK 型別文件寫明 `{ type: 'adaptive' }` 是「支援的模型的預設值」——省略 thinking
+// 只是「不主動要求」，模型端照樣自己開、照樣產 thinking block，reasoning_content 照回。
+// 要關就得明確送 `{ type: 'disabled' }`。這才是把思考鏈趕回正文層的正解：
+// 模型不產 block，那份 token 也不燒。
 function thinkingOption() {
-  return configThinking ? { thinking: { type: 'adaptive', display: 'summarized' } } : {};
+  return configThinking
+    ? { thinking: { type: 'adaptive', display: 'summarized' } }
+    : { thinking: { type: 'disabled' } };
 }
 
 const MODELS = [
@@ -327,7 +334,8 @@ async function handleChatCompletions(req, res) {
           if (msg.type === 'assistant') {
             for (const block of msg.message?.content || []) {
               if (block.type === 'text') fullText += block.text || '';
-              else if (block.type === 'thinking') thinkingText += block.thinking || '';
+              // 第二層防禦（26-07-27 退修）：就算模型端仍產 thinking block，關閉時也不收
+              else if (configThinking && block.type === 'thinking') thinkingText += block.thinking || '';
             }
           } else if (msg.type === 'result') {
             costUsd = Number(msg.cost_usd) || 0;
@@ -409,7 +417,8 @@ async function handleChatCompletions(req, res) {
           if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
             const textChunk = makeChunk(completionId, modelId, { content: event.delta.text }, null);
             if (!ticket.aborted) res.write(`data: ${JSON.stringify(textChunk)}\n\n`);
-          } else if (event.type === 'content_block_delta' && event.delta?.type === 'thinking_delta' && event.delta.thinking) {
+            // 第二層防禦（26-07-27 退修）：關閉時不往酒館轉發，即使模型端仍產 thinking
+          } else if (configThinking && event.type === 'content_block_delta' && event.delta?.type === 'thinking_delta' && event.delta.thinking) {
             const thinkChunk = makeChunk(completionId, modelId, { reasoning_content: event.delta.thinking }, null);
             if (!ticket.aborted) res.write(`data: ${JSON.stringify(thinkChunk)}\n\n`);
           }
@@ -532,7 +541,7 @@ const info = {
   id: PLUGIN_ID,
   name: 'Claude Bridge',
   description: 'Bridges SillyTavern to Claude via official Agent SDK and local subscription auth.',
-  version: '1.2.0',
+  version: '1.2.1',
 };
 
 async function init(router) {
