@@ -46,12 +46,17 @@ function effortOption() {
 // 預設關的理由：現役使用者 100% 用帶思考鏈的預設，這股對他們是冗餘＋燒 token；
 // 素卡使用者想要原生摘要再自己打開。
 let configThinking = false;
+let warnedNoSystemPrompt = false;   // 「有 system 卻沒系統提示」的提醒每次啟動只講一次
 
 // 26-07-27 退修（霽野實彈驗收 FAIL）：**不送參數 ≠ 關閉**。
 // SDK 型別文件寫明 `{ type: 'adaptive' }` 是「支援的模型的預設值」——省略 thinking
 // 只是「不主動要求」，模型端照樣自己開、照樣產 thinking block，reasoning_content 照回。
-// 要關就得明確送 `{ type: 'disabled' }`。這才是把思考鏈趕回正文層的正解：
-// 模型不產 block，那份 token 也不燒。
+// 要關就得明確送 `{ type: 'disabled' }`。這才是把思考鏈趕回正文層的正解。
+// 誠實邊界（Grok MED-4，26-07-27）：Always-on 思考的模型仍可能在模型端 think，
+// 本層只保證**不回酒館**，不保證那份 token 完全不燒。
+// ⚠️ 隱式依賴：Messages API 的模型能力矩陣其實會拒某些組合（fable 拒 disabled／
+// haiku 拒 adaptive），我們沒踩到是因為 Agent SDK 那層有容錯（霽野 26-07-27 兩發實彈驗過）。
+// **SDK 升級後要重跑 fable+disabled／haiku+adaptive 兩發實彈**，那層容錯不是我們的合約。
 function thinkingOption() {
   return configThinking
     ? { thinking: { type: 'adaptive', display: 'summarized' } }
@@ -78,6 +83,18 @@ function toImageBlock(part) {
   const m = url.match(/^data:([^;,]+);base64,(.+)$/);
   if (!m) return null;
   return { type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } };
+}
+
+// 空回覆時印出黑盒子，並回一句使用者看得懂的話取代空字串（26-07-27 綾案）。
+// 空字串在酒館裡跟「當機」長得一模一樣——沉浸感讓一步，換使用者知道發生什麼事。
+function emptyReplyNotice(reqNo, blockTypes, diag) {
+  const parts = [`blocks=[${blockTypes.length ? blockTypes.join(',') : '無'}]`];
+  for (const k of ['stop_reason', 'subtype', 'num_turns', 'is_error']) {
+    if (diag[k] !== undefined) parts.push(`${k}=${diag[k]}`);
+  }
+  console.warn(`[${PLUGIN_ID}][${reqNo}] ⚠️ 空回覆 — ${parts.join(' ')}`);
+  return '（這一則模型沒有產出任何文字。診斷資訊已印在 SillyTavern 的終端機視窗，'
+    + '找 “空回覆” 那一行。可以先按重新生成試一次。）';
 }
 
 function renderTurn(m) {
@@ -116,17 +133,31 @@ function parseMessages(messages) {
           content += (p && p.text) || '';
         }
       }
+    } else if (msg.content != null) {
+      // 非 string 非 array（number／object／boolean）——舊版靜默清成空字串送出去，
+      // 使用者只會看到模型答非所問，完全無跡可循（Grok MED-1）。轉字串並留聲音。
+      content = String(msg.content);
+      console.warn(`[${PLUGIN_ID}] 非預期的 content 型別（${typeof msg.content}），已轉字串處理`);
     }
 
     if (msg.role === 'system' && !headerDone) {
       systemParts.push(content);
       continue;
     }
+
+    // header 階段的空白訊息＝佔位符，跳過不算數（26-07-27 綾案退步修復）。
+    // 她的序列是 user(空),system×4,user,... —— 舊規則在第一則就判定 header 結束，
+    // 94 則 system 全落進對話流、systemPrompt=undefined，角色卡一個字都沒進系統提示。
+    // 分界的正確定義是「第一則**有實質內容**的非 system 訊息」，不是「第一則非 system」。
+    if (!headerDone && content.trim() === '' && images.length === 0) continue;
+
     if (msg.role !== 'system') headerDone = true;
     flow.push({ role: msg.role, content, images });
   }
 
-  const systemPrompt = systemParts.join('\n\n') || undefined;
+  // 空段落要濾掉再 join——否則兩則空 system 會拼出 "\n\n"，那是 truthy，
+  // 等於送一個「看起來有、其實空白」的系統提示出去（Grok MED-2）。
+  const systemPrompt = systemParts.filter(s => s.trim() !== '').join('\n\n') || undefined;
 
   // 當前訊息取「最後一則 **user**」，不是「最後一則」——depth=0 的注入會排在玩家發言之後，
   // 舊版直接把它當成玩家現在說的話送出去（綾案：最後一則是 MVU 規則）。
@@ -303,6 +334,14 @@ async function handleChatCompletions(req, res) {
     // 沒有這行就只能靠臨時插碼才診斷得出來（26-07-27 實案）。長度而已，不印內容。
     const sysCount = messages.filter(m => m && m.role === 'system').length;
     const shape = `sys=${systemPrompt ? systemPrompt.length : 0}字/${sysCount}則 msgs=${messages.length}`;
+
+    // 有 system 訊息卻拼不出系統提示＝對話開頭就是使用者訊息，所有 system 都屬對話流。
+    // 這是規則的正確行為（位置語義優先），但它讓「角色卡沒進系統提示」變成靜默狀態，
+    // 所以出一次聲（每次啟動只講一次，不洗版）——綾 26-07-27 驗收建議 (c)。
+    if (!systemPrompt && sysCount > 0 && !warnedNoSystemPrompt) {
+      warnedNoSystemPrompt = true;
+      console.warn(`[${PLUGIN_ID}] 注意：本次請求有 ${sysCount} 則系統訊息，但系統提示是空的——你的對話開頭是使用者訊息，所以每一則 system 都留在對話流的原位（位置語義優先）。角色扮演若不穩定，可從預設的訊息結構查起。此訊息每次啟動只出現一次。`);
+    }
     const completionId = `chatcmpl-${randomUUID().slice(0, 8)}`;
     // 有圖 → 串流輸入模式（SDK 才收得到 image block）；沒圖 → 維持原本的字串 prompt
     const hasImages = images.length > 0;
@@ -313,6 +352,8 @@ async function handleChatCompletions(req, res) {
         let fullText = '';
         let thinkingText = '';
         let costUsd = 0;
+        const blockTypes = [];   // 這輪模型產出的 block 型別序列（空回覆診斷用）
+        const diag = {};         // result 的 subtype/num_turns/is_error 與 stop_reason
         const q = queryFn({
           prompt: buildPrompt(),
           options: {
@@ -333,12 +374,17 @@ async function handleChatCompletions(req, res) {
           if (ticket.aborted) break;
           if (msg.type === 'assistant') {
             for (const block of msg.message?.content || []) {
+              blockTypes.push(block.type);   // 空回覆時唯一的線索：這輪到底產出了什麼
               if (block.type === 'text') fullText += block.text || '';
               // 第二層防禦（26-07-27 退修）：就算模型端仍產 thinking block，關閉時也不收
               else if (configThinking && block.type === 'thinking') thinkingText += block.thinking || '';
             }
+            if (msg.message?.stop_reason) diag.stop_reason = msg.message.stop_reason;
           } else if (msg.type === 'result') {
             costUsd = Number(msg.cost_usd) || 0;
+            diag.subtype = msg.subtype;
+            diag.num_turns = msg.num_turns;
+            diag.is_error = msg.is_error;
             break; // 串流輸入模式不會自己收尾（SDK 等下一則輸入），拿到 result 就走
           }
         }
@@ -349,6 +395,13 @@ async function handleChatCompletions(req, res) {
         requestCount++;
         totalCostUsd += costUsd;
         console.log(`[${PLUGIN_ID}][${requestCount}] model=${modelId} effort=${configEffort} ${shape}${hasImages ? ` img=${images.length}` : ''} cost=$${costUsd.toFixed(4)} total=$${totalCostUsd.toFixed(4)}${usage ? ` in=${usage.input_tokens} out=${usage.output_tokens}` : ' usage=n/a'}`);
+
+        // 空回覆的黑盒子（26-07-27 綾案）：bridge 原本只記請求不記回應，
+        // 模型吐出一片空白時完全沒有線索，使用者只看得到「送出去、回來是空的」。
+        // 這一行是分辨「模型拒答／產出非 text block／SDK 提前收尾」的唯一依據。
+        if (!fullText.trim() && !ticket.aborted) {
+          fullText = emptyReplyNotice(requestCount, blockTypes, diag);
+        }
 
         const responseBody = {
           id: completionId,
@@ -410,11 +463,21 @@ async function handleChatCompletions(req, res) {
 
     try {
       let costUsd = 0;
+      let sentText = false;    // 這輪有沒有真的送出過文字（空回覆診斷用）
+      const blockTypes = [];
+      const diag = {};
       for await (const msg of q) {
         if (ticket.aborted) break;
         if (msg.type === 'stream_event') {
           const event = msg.event;
+          if (event.type === 'content_block_start' && event.content_block?.type) {
+            blockTypes.push(event.content_block.type);
+          }
+          if (event.type === 'message_delta' && event.delta?.stop_reason) {
+            diag.stop_reason = event.delta.stop_reason;
+          }
           if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+            if (event.delta.text) sentText = true;
             const textChunk = makeChunk(completionId, modelId, { content: event.delta.text }, null);
             if (!ticket.aborted) res.write(`data: ${JSON.stringify(textChunk)}\n\n`);
             // 第二層防禦（26-07-27 退修）：關閉時不往酒館轉發，即使模型端仍產 thinking
@@ -424,6 +487,9 @@ async function handleChatCompletions(req, res) {
           }
         } else if (msg.type === 'result') {
           costUsd = Number(msg.cost_usd) || 0;
+          diag.subtype = msg.subtype;
+          diag.num_turns = msg.num_turns;
+          diag.is_error = msg.is_error;
           break; // 串流輸入模式不會自己收尾，拿到 result 就走
         }
       }
@@ -436,6 +502,11 @@ async function handleChatCompletions(req, res) {
       console.log(`[${PLUGIN_ID}][${requestCount}] model=${modelId} effort=${configEffort} ${shape}${hasImages ? ` img=${images.length}` : ''} cost=$${costUsd.toFixed(4)} total=$${totalCostUsd.toFixed(4)}${usage ? ` in=${usage.input_tokens} out=${usage.output_tokens}` : ' usage=n/a'}${ticket.aborted ? ' (讓位/斷線)' : ''}`);
 
       if (!ticket.aborted) {
+        // 整輪一個字都沒送出＝空回覆。印黑盒子，並補一則通知取代空白畫面（26-07-27 綾案）
+        if (!sentText) {
+          const notice = makeChunk(completionId, modelId, { content: emptyReplyNotice(requestCount, blockTypes, diag) }, null);
+          res.write(`data: ${JSON.stringify(notice)}\n\n`);
+        }
         const stopChunk = makeChunk(completionId, modelId, {}, 'stop');
         res.write(`data: ${JSON.stringify(stopChunk)}\n\n`);
         res.write('data: [DONE]\n\n');
@@ -541,7 +612,7 @@ const info = {
   id: PLUGIN_ID,
   name: 'Claude Bridge',
   description: 'Bridges SillyTavern to Claude via official Agent SDK and local subscription auth.',
-  version: '1.2.1',
+  version: '1.2.2',
 };
 
 async function init(router) {
