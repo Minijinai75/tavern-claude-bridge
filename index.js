@@ -2,7 +2,7 @@ const PLUGIN_ID = 'tavern-claude-bridge';
 const API_BASE = `/api/plugins/${PLUGIN_ID}`;
 const UI_PREFIX = 'tcb';
 const SETTINGS_KEY = 'tavern_claude_bridge';
-const LOCAL_VERSION = '1.2.3';
+const LOCAL_VERSION = '1.3.0';
 const GITHUB_RELEASE_API = 'https://api.github.com/repos/Minijinai75/tavern-claude-bridge/releases/latest';
 let updateCache;
 
@@ -118,7 +118,11 @@ function buildPanel() {
           <button id="${UI_PREFIX}-refresh" class="menu_button" type="button">
             <i class="fa-solid fa-rotate"></i> 重新偵測
           </button>
+          <button id="${UI_PREFIX}-selftest" class="menu_button" type="button">
+            <i class="fa-solid fa-stethoscope"></i> 自我健檢
+          </button>
         </div>
+        <div class="${UI_PREFIX}-info" id="${UI_PREFIX}-selftest-out"></div>
         <div class="${UI_PREFIX}-guide">
           <details>
             <summary>連線設定指引</summary>
@@ -145,6 +149,35 @@ function buildPanel() {
   const modelsEl = drawer.querySelector(`#${UI_PREFIX}-models`);
   const refreshBtn = drawer.querySelector(`#${UI_PREFIX}-refresh`);
   const thinkingEl = drawer.querySelector(`#${UI_PREFIX}-thinking`);
+
+  // 自我健檢：在 SillyTavern 這個進程裡實打一發，分辨「環境問題」與「設定問題」。
+  // 立案理由（26-07-29 Anna 實案）：她的酒館整晚回空白，自己做排除法才確認
+  // 「同一份 SDK 在她程式裡正常、透過酒館全失敗」，最後查出是登入憑證沒更新成功。
+  // 那份排除本來就該由這支橋自己回答——它跑在那個進程裡，最有資格說「我在這裡叫不叫得動」。
+  const selftestBtn = drawer.querySelector(`#${UI_PREFIX}-selftest`);
+  const selftestOut = drawer.querySelector(`#${UI_PREFIX}-selftest-out`);
+  if (selftestBtn && selftestOut) {
+    selftestBtn.addEventListener('click', async () => {
+      selftestBtn.disabled = true;
+      selftestOut.textContent = '正在實打一發 Haiku…（會用掉一點點額度）';
+      try {
+        const res = await fetch(`${API_BASE}/selftest`, {
+          method: 'POST', headers: getHeaders(), body: '{}',
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const r = await res.json();
+        selftestOut.textContent = r.ok
+          ? `✅ ${r.message}${r.reply ? `（模型回：${r.reply}）` : ''}`
+          : `${r.message}\n診斷：blocks=[${(r.blocks || []).join(',') || '無'}]`
+            + ` subtype=${r.subtype ?? 'n/a'} is_error=${r.is_error ?? 'n/a'}`;
+      } catch (e) {
+        // 不靜默——這顆按鈕的存在意義就是「不要讓失敗長得像沒發生」
+        selftestOut.textContent = `❌ 健檢請求本身失敗：${e.message}（plugin 可能沒載入，或 SillyTavern 需要重啟）`;
+      } finally {
+        selftestBtn.disabled = false;
+      }
+    });
+  }
 
   if (thinkingEl) {
     thinkingEl.checked = !!settings.sdkThinking;

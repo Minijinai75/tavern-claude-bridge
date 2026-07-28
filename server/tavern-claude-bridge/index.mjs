@@ -116,6 +116,27 @@ const EMPTY_REASONS = [
     say: '這一則撞到費用上限被中止了。',
   },
   {
+    // 26-07-29 加：**空回覆的第一個確診病因＝登入憑證失效**（Anna 實案）。
+    // 她的實況：`blocks=[無] subtype=success is_error=true usage=n/a cost=$0.0000`——
+    // 模型一個字都沒吐、沒有 token 統計、沒扣費＝根本沒被呼叫成功；而她自己排除到
+    // 「同一份 SDK 在自己程式裡跑正常，透過酒館全失敗，連 Haiku 都失敗」，最後查出是
+    // 憑證沒更新成功。指紋：**沒有任何 block ＋ 標記出錯 ＋ 零成本**（真的跑起來過的請求
+    // 就算失敗也多半留得下痕跡）。
+    // 這條必須排在「執行錯誤」前面——**對憑證問題叫人「按重新生成」是錯的指示，
+    // 按一百次也沒用**，而給錯指示比不給更糟。
+    // 判準要抓那個**矛盾組合**：SDK 說 `success` 卻同時標 `is_error`——它自己都說不清楚
+    // 發生什麼事，正是「還沒真的開始就結束了」的樣子。若 subtype 明講是 error_during_execution
+    // 之類，那 SDK 已經告訴你是執行錯誤了，這條不該搶（26-07-29 寫測試時被 R4 打回來才修對）。
+    match: d => d.is_error === true
+      && (d.subtype === 'success' || d.subtype === undefined)
+      && Array.isArray(d.blockTypes) && d.blockTypes.length === 0
+      && (d.costUsd === 0 || d.costUsd === undefined),
+    label: '模型沒被叫起來（多半是登入憑證）',
+    say: '模型一個字都沒吐、也沒有任何用量——通常是 Claude Code 的登入憑證過期或沒更新成功，'
+      + '重新生成不會有幫助。請到終端機執行 `claude login` 重新登入，然後**重啟 SillyTavern**（憑證是啟動時載入的）。'
+      + '想直接確認的話，在擴充面板按「自我健檢」，它會在酒館這個進程裡實打一發告訴你通不通。',
+  },
+  {
     match: d => d.subtype === 'error_during_execution' || d.is_error === true,
     label: '執行錯誤',
     say: '這一則在生成過程中出錯了。可以先按重新生成試一次；連續發生請看終端機那行診斷。',
@@ -144,6 +165,46 @@ function emptyReplyNotice(reqNo, blockTypes, diag) {
     ? `（${hit.label}）${hit.say}`
     : '（這一則模型沒有產出任何文字，而且成因不在已知清單裡。診斷資訊已印在 SillyTavern 的'
       + '終端機視窗，找 “空回覆” 那一行——把那行貼給維護者，這是目前唯一的線索。可以先按重新生成試一次。）';
+}
+
+// SDK 回報錯誤時，把它給的東西整包印出來（26-07-29 加，Anna 案）。
+// 病史：Anna 回報 `blocks=[無] subtype=success is_error=true usage=n/a cost=$0`——
+// 模型連一個字都沒吐、沒有 token 統計、沒扣費＝**根本沒開始生成**。而 `subtype=success`
+// 配 `is_error=true` 這個組合本身就矛盾，代表 SDK 有話要說，只是我們沒印。
+// 我們原本只收 subtype／num_turns／is_error 三個旗標，**把 SDK 放在 result 訊息裡的
+// 錯誤內容整包丟掉了**——等於拿到病歷卻只抄了體溫。
+// 只在出錯時印，正常路徑零噪音；截斷 1200 字元防洗版。
+function dumpResultOnError(reqNo, msg) {
+  try {
+    if (!msg || (msg.subtype === 'success' && msg.is_error !== true)) return;
+    const copy = {};
+    for (const [k, v] of Object.entries(msg)) {
+      if (k === 'type') continue;
+      copy[k] = typeof v === 'string' && v.length > 400 ? v.slice(0, 400) + '…(截斷)' : v;
+    }
+    const s = JSON.stringify(copy);
+    console.warn(`[${PLUGIN_ID}][${reqNo}] 🔎 SDK result 原文：${s.length > 1200 ? s.slice(0, 1200) + '…(截斷)' : s}`);
+  } catch {}
+}
+
+// 執行環境指紋（啟動時印一次）。
+// 為什麼需要（Anna 26-07-29 案的直接教訓）：她自己測到「同一份 SDK、同樣參數，在她的程式裡
+// 跑正常，**透過酒館就全失敗，連 Haiku 都失敗**」——差異只剩「跑在哪個進程裡」。
+// SDK 是靠 spawn `claude` 子程序工作的，所以 ST 進程的 node 版本、cwd、家目錄、
+// 有沒有自訂 CLAUDE_CONFIG_DIR，全都會影響它找不找得到 CLI 與登入憑證。
+// 這幾行印出來，下次同型問題五分鐘就能對帳，不必再花一晚做排除法。
+// 只印「有沒有／叫什麼」，不印 PATH 全文與任何憑證內容。
+function logEnvFingerprint() {
+  try {
+    const home = process.env.USERPROFILE || process.env.HOME || '(未設)';
+    const cfgDir = process.env.CLAUDE_CONFIG_DIR;
+    console.log(
+      `[${PLUGIN_ID}] 執行環境：node ${process.version}｜platform ${process.platform}`
+      + `｜cwd ${process.cwd()}`
+      + `｜家目錄 ${home === '(未設)' ? '⚠️ 未設' : '已設'}`
+      + `｜CLAUDE_CONFIG_DIR ${cfgDir ? cfgDir : '(未設，走預設 ~/.claude)'}`
+    );
+  } catch {}
 }
 
 function renderTurn(m) {
@@ -476,9 +537,11 @@ async function handleChatCompletions(req, res) {
             if (msg.message?.stop_reason) diag.stop_reason = msg.message.stop_reason;
           } else if (msg.type === 'result') {
             costUsd = Number(msg.cost_usd) || 0;
+            diag.costUsd = costUsd;   // 「零成本」是「模型根本沒被叫起來」的指紋之一
             diag.subtype = msg.subtype;
             diag.num_turns = msg.num_turns;
             diag.is_error = msg.is_error;
+            dumpResultOnError(requestCount + 1, msg);   // 出錯才印，正常路徑零噪音
             break; // 串流輸入模式不會自己收尾（SDK 等下一則輸入），拿到 result 就走
           }
         }
@@ -581,9 +644,11 @@ async function handleChatCompletions(req, res) {
           }
         } else if (msg.type === 'result') {
           costUsd = Number(msg.cost_usd) || 0;
+          diag.costUsd = costUsd;   // 「零成本」是「模型根本沒被叫起來」的指紋之一
           diag.subtype = msg.subtype;
           diag.num_turns = msg.num_turns;
           diag.is_error = msg.is_error;
+          dumpResultOnError(requestCount + 1, msg);   // 出錯才印，正常路徑零噪音
           break; // 串流輸入模式不會自己收尾，拿到 result 就走
         }
       }
@@ -674,6 +739,16 @@ function startBridge(port) {
           return;
         }
 
+        // 5199 直連版的自我健檢（給 curl 用；面板走同源的 router 版）
+        if (req.method === 'POST' && req.url === '/selftest') {
+          const r = await runSelfTest();
+          console.log(`[${PLUGIN_ID}] 自我健檢：${r.ok ? '✅' : '❌'} ${r.message}`);
+          if (r.raw) console.warn(`[${PLUGIN_ID}] 自我健檢 result 原文：${r.raw}`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(r));
+          return;
+        }
+
         if (req.method === 'POST' && req.url === '/v1/chat/completions') {
           await handleChatCompletions(req, res);
           return;
@@ -706,10 +781,60 @@ const info = {
   id: PLUGIN_ID,
   name: 'Claude Bridge',
   description: 'Bridges SillyTavern to Claude via official Agent SDK and local subscription auth.',
-  version: '1.2.3',
+  version: '1.3.0',
 };
 
+// 自我健檢：在**這個進程裡**實打一發最便宜的模型，驗 SDK 到底通不通（26-07-29 加，Anna 案）。
+// 為什麼要有：Anna 花了一整晚做排除法才確認「SDK 沒問題、參數沒問題、只有透過酒館才失敗」。
+// 那份排除本來該由這支橋自己回答——它就跑在那個進程裡，最有資格說「我在這裡叫不叫得動 SDK」。
+// 不自動跑（會燒額度），由使用者從面板或 curl 主動觸發。
+async function runSelfTest() {
+  const t0 = Date.now();
+  if (!queryFn) {
+    return { ok: false, stage: 'sdk-load', message: 'SDK 沒載入——請在 plugins/tavern-claude-bridge/ 執行 npm install 後重啟 SillyTavern。' };
+  }
+  try {
+    const q = queryFn({
+      prompt: '回答一個字：好',
+      options: {
+        tools: [], maxTurns: 1, model: 'claude-haiku-4-5',
+        permissionMode: 'dontAsk', persistSession: false, settingSources: [],
+        thinking: { type: 'disabled' },
+      },
+    });
+    let text = '';
+    const blocks = [];
+    let result = null;
+    for await (const msg of q) {
+      if (msg.type === 'assistant') {
+        for (const b of msg.message?.content || []) {
+          blocks.push(b.type);
+          if (b.type === 'text') text += b.text || '';
+        }
+      } else if (msg.type === 'result') { result = msg; break; }
+    }
+    const ms = Date.now() - t0;
+    if (text.trim()) {
+      return { ok: true, stage: 'done', ms, reply: text.trim().slice(0, 40), message: `通了（${ms}ms）——SDK 在 SillyTavern 這個進程裡叫得動，問題不在環境。` };
+    }
+    // 這裡才是 Anna 那個症狀：跑完了、但一個字都沒有
+    return {
+      ok: false, stage: 'empty', ms,
+      blocks, subtype: result?.subtype, is_error: result?.is_error,
+      raw: result ? JSON.stringify(result).slice(0, 800) : null,
+      message: '❌ SDK 在這個進程裡叫得動、但模型一個字都沒吐——這是環境層問題不是設定問題。'
+        + '把這整段連同上面那行「執行環境：…」貼給維護者。',
+    };
+  } catch (err) {
+    return {
+      ok: false, stage: 'throw', ms: Date.now() - t0,
+      message: `❌ SDK 在這個進程裡直接拋錯：${err.message}`,
+    };
+  }
+}
+
 async function init(router) {
+  logEnvFingerprint();
   try {
     const sdk = await import('@anthropic-ai/claude-agent-sdk');
     queryFn = sdk.query;
@@ -744,6 +869,14 @@ async function init(router) {
   // effort 設定走 ST 自己的 router（同源），不走 5199——瀏覽器 CORS 擋跨 port 直連
   router.get('/config', (_req, res) => {
     res.json({ effort: configEffort, thinking: configThinking });
+  });
+
+  // 自我健檢（主動觸發，會打一發 haiku）——同源路徑供前端面板用
+  router.post('/selftest', async (_req, res) => {
+    const r = await runSelfTest();
+    console.log(`[${PLUGIN_ID}] 自我健檢：${r.ok ? '✅' : '❌'} ${r.message}`);
+    if (r.raw) console.warn(`[${PLUGIN_ID}] 自我健檢 result 原文：${r.raw}`);
+    res.json(r);
   });
 
   router.post('/config', (req, res) => {
