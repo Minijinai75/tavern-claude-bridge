@@ -85,6 +85,48 @@ function toImageBlock(part) {
   return { type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } };
 }
 
+// 空回覆的成因分流（26-07-28 加，官方 cookbook 深讀）。
+// 在此之前空回覆只有一種訊息：「模型沒有產出任何文字」——正確但沒用，因為成因不只一種，
+// 而使用者能做的事按成因完全不同（換句話說 vs 按重新生成 vs 這是我方設定問題）。
+// 官方明列的關鍵事實：`result` 欄位**只有 subtype === 'success' 時才存在**，
+// `error_max_turns` 那類根本沒有；`stop_reason: 'refusal'` 代表模型拒答。
+// 而我們設 maxTurns: 1 —— **模型只要想動一次工具就會撞 error_max_turns**，
+// 在酒館端長得跟拒答、跟真的沒話講一模一樣（綾 26-07-27 那個查不出病因的間歇性空回覆，
+// 這是候選解釋之一，而且解釋得通「為什麼間歇」：同一張卡有時模型想動工具、有時不想）。
+const EMPTY_REASONS = [
+  {
+    match: d => d.stop_reason === 'refusal',
+    label: '模型拒答',
+    say: '這一則模型選擇不回應（安全層攔下）。換個說法或調整情節通常就過得去——這不是當機。',
+  },
+  {
+    match: d => d.subtype === 'error_max_turns',
+    label: '撞回合上限',
+    say: '這一則模型想動用工具，但這座橋只允許一次回合就結束（不開放工具）。'
+      + '通常是提示詞裡有「請搜尋／請執行」這類指令引發的，把那類句子拿掉就好。',
+  },
+  {
+    match: d => d.stop_reason === 'max_tokens',
+    label: '長度上限',
+    say: '這一則在還沒開始寫正文前就用完了額度上限。若開著思考功能，先關掉再試一次。',
+  },
+  {
+    match: d => d.subtype === 'error_max_budget_usd',
+    label: '費用上限',
+    say: '這一則撞到費用上限被中止了。',
+  },
+  {
+    match: d => d.subtype === 'error_during_execution' || d.is_error === true,
+    label: '執行錯誤',
+    say: '這一則在生成過程中出錯了。可以先按重新生成試一次；連續發生請看終端機那行診斷。',
+  },
+  {
+    match: d => Array.isArray(d.blockTypes) && d.blockTypes.length > 0 && !d.blockTypes.includes('text'),
+    label: '只產出非文字內容',
+    say: '這一則模型只產出了思考、沒有寫出正文。把「SDK 原生思考」關掉通常可解（擴充面板裡）。',
+  },
+];
+
 // 空回覆時印出黑盒子，並回一句使用者看得懂的話取代空字串（26-07-27 綾案）。
 // 空字串在酒館裡跟「當機」長得一模一樣——沉浸感讓一步，換使用者知道發生什麼事。
 function emptyReplyNotice(reqNo, blockTypes, diag) {
@@ -92,9 +134,16 @@ function emptyReplyNotice(reqNo, blockTypes, diag) {
   for (const k of ['stop_reason', 'subtype', 'num_turns', 'is_error']) {
     if (diag[k] !== undefined) parts.push(`${k}=${diag[k]}`);
   }
-  console.warn(`[${PLUGIN_ID}][${reqNo}] ⚠️ 空回覆 — ${parts.join(' ')}`);
-  return '（這一則模型沒有產出任何文字。診斷資訊已印在 SillyTavern 的終端機視窗，'
-    + '找 “空回覆” 那一行。可以先按重新生成試一次。）';
+
+  const hit = EMPTY_REASONS.find(r => r.match({ ...diag, blockTypes }));
+  const label = hit ? hit.label : '成因不明';
+  console.warn(`[${PLUGIN_ID}][${reqNo}] ⚠️ 空回覆（${label}） — ${parts.join(' ')}`);
+
+  // 認得出成因就直說並給路；認不出才回原本那句保守的話（不要假裝知道）
+  return hit
+    ? `（${hit.label}）${hit.say}`
+    : '（這一則模型沒有產出任何文字，而且成因不在已知清單裡。診斷資訊已印在 SillyTavern 的'
+      + '終端機視窗，找 “空回覆” 那一行——把那行貼給維護者，這是目前唯一的線索。可以先按重新生成試一次。）';
 }
 
 function renderTurn(m) {
