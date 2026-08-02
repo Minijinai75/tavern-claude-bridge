@@ -11,7 +11,7 @@ const DEFAULT_SETTINGS = {
   // Claude 原生思考摘要。預設關——詳細理由見 server 端 thinkingOption() 上方註解，
   // 簡版：它跟預設自己的 <thinking> 思考鏈搶同一條通道，開著反而讓思考中英不穩。
   sdkThinking: false,
-  // 拆塊省快取。預設開（26-08-03 Mini 拍板）——真實流量實測一則 $2.3459 → $0.7149。
+  // 拆塊省快取。預設開（26-08-03 起）——真實流量實測一則 $2.3459 → $0.7149。
   // 後端也預設開，所以沒裝這個前端面板的人一樣受益；這格只是讓使用者關得掉。
   cacheSplit: true,
 };
@@ -165,8 +165,8 @@ function buildPanel() {
   const cacheEl = drawer.querySelector(`#${UI_PREFIX}-cache`);
 
   // 自我健檢：在 SillyTavern 這個進程裡實打一發，分辨「環境問題」與「設定問題」。
-  // 立案理由（26-07-29 Anna 實案）：她的酒館整晚回空白，自己做排除法才確認
-  // 「同一份 SDK 在她程式裡正常、透過酒館全失敗」，最後查出是登入憑證沒更新成功。
+  // 立案理由（26-07-29 外部使用者實案）：對方的酒館整晚回空白，自己做排除法才確認
+  // 「同一份 SDK 在自己程式裡正常、透過酒館全失敗」，最後查出是登入憑證沒更新成功。
   // 那份排除本來就該由這支橋自己回答——它跑在那個進程裡，最有資格說「我在這裡叫不叫得動」。
   const selftestBtn = drawer.querySelector(`#${UI_PREFIX}-selftest`);
   const selftestOut = drawer.querySelector(`#${UI_PREFIX}-selftest-out`);

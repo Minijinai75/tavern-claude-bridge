@@ -73,8 +73,8 @@ function systemPromptForSdk(systemPrompt) {
 // 26-08-02 翻案後的預設：開。理由與取捨——
 // ・省很大：同樣內容從讀 7,023／寫 4,978（$0.0541）變成讀 12,001／寫 0（$0.0066），省 88%
 // ・零語義風險：這個開關不改任何送進模型的訊息內容，只影響 SDK 要不要保存 session
-// ・代價是磁碟上會留 session 檔。Mini 26-08-02 拍板可接受，原話「玩酒館的時候對話本來
-//   就會留在本機那個不是大問題」「在意的話根本不會玩酒館」——所以對外也預設開。
+// ・代價是磁碟上會留 session 檔。評估後認為可接受：玩酒館的對話本來就會留在本機，
+//   真的在意這件事的人不會用酒館——所以對外也預設開。
 // ・不吃 resume：實測顯示光是 true 就整包命中，不需要橋去記 sessionId（那會引入跨請求狀態）
 // 設 TCB_PERSIST_SESSION=0 可退回舊行為（每則一次性 session，不留檔但吃不到對話流快取）。
 function persistSessionOption() {
@@ -139,7 +139,7 @@ const MAX_BODY_BYTES = 4 * 1024 * 1024;
 
 // 讓前一則停下來。26-07-25 改：原本「同時只准一個、後來的回 429」，
 // 在 RP 場景是錯的——玩家按重新生成/停止時，想要的是「換一則」不是「排隊」，
-// 而酒館超時斷線後舊的還在跑，重試就一直吃 429（Mini 26-07-25 實際踩到）。
+// 而酒館超時斷線後舊的還在跑，重試就一直吃 429（實際使用時踩到）。
 // interrupt() 官方註明只在串流輸入模式可用（我們是單次字串輸入），所以兩段式：
 // 先試 interrupt、退而求其次 return()，都失敗就靠 aborted 旗標讓迴圈自己收。
 async function releaseCurrent(reason) {
@@ -154,7 +154,7 @@ async function releaseCurrent(reason) {
 
 // 'auto'＝完全不送 effort，交給 SDK 的 adaptive 自己決定。
 // 酒館對這個選項的原生說明就是「選擇 Auto 不會傳送推理耗費等級」，照它的語義做；
-// 預設也改回 auto——26-07-24 硬寫 medium 那版沒得選，Mini 只能吃我們替她決定的檔位。
+// 預設也改回 auto——26-07-24 硬寫 medium 那版沒得選，使用者只能吃我們替他決定的檔位。
 const VALID_EFFORTS = ['auto', 'low', 'medium', 'high', 'max'];
 let configEffort = 'auto';
 
@@ -162,8 +162,8 @@ function effortOption() {
   return configEffort === 'auto' ? {} : { outputConfig: { effort: configEffort } };
 }
 
-// SDK 原生思考摘要（26-07-27 加開關，霽野裁定預設關）。
-// 病理（霽野讀 jsonl 實證）：思考只有 SDK thinking block 一條通道，開著的時候，
+// SDK 原生思考摘要（26-07-27 加開關，預設關）。
+// 病理（讀聊天記錄檔實證）：思考只有 SDK thinking block 一條通道，開著的時候，
 // 預設要求的中文思考鏈**有時搶到、有時被模型原生英文腦蓋掉**，而正文的 `<thinking>`
 // 只剩空標籤——預設設計的位置被架空，這才是中英不穩的真因，不是「兩股並跑」。
 // 關掉＝把思考鏈趕回 prompt 管得住的正文層，酒館照樣解析得到、使用者照樣看得見。
@@ -173,14 +173,14 @@ function effortOption() {
 let configThinking = false;
 let warnedNoSystemPrompt = false;   // 「有 system 卻沒系統提示」的提醒每次啟動只講一次
 
-// 26-07-27 退修（霽野實彈驗收 FAIL）：**不送參數 ≠ 關閉**。
+// 26-07-27 退修（實彈驗收 FAIL）：**不送參數 ≠ 關閉**。
 // SDK 型別文件寫明 `{ type: 'adaptive' }` 是「支援的模型的預設值」——省略 thinking
 // 只是「不主動要求」，模型端照樣自己開、照樣產 thinking block，reasoning_content 照回。
 // 要關就得明確送 `{ type: 'disabled' }`。這才是把思考鏈趕回正文層的正解。
 // 誠實邊界（Grok MED-4，26-07-27）：Always-on 思考的模型仍可能在模型端 think，
 // 本層只保證**不回酒館**，不保證那份 token 完全不燒。
 // ⚠️ 隱式依賴：Messages API 的模型能力矩陣其實會拒某些組合（fable 拒 disabled／
-// haiku 拒 adaptive），我們沒踩到是因為 Agent SDK 那層有容錯（霽野 26-07-27 兩發實彈驗過）。
+// haiku 拒 adaptive），我們沒踩到是因為 Agent SDK 那層有容錯（26-07-27 兩發實彈驗過）。
 // **SDK 升級後要重跑 fable+disabled／haiku+adaptive 兩發實彈**，那層容錯不是我們的合約。
 function thinkingOption() {
   return configThinking
@@ -188,7 +188,7 @@ function thinkingOption() {
     : { thinking: { type: 'disabled' } };
 }
 
-// 拆塊快取開關（26-08-03 Mini 拍板：預設開，逃生門留著）。
+// 拆塊快取開關（26-08-03 起預設開，逃生門留著）。
 // 做什麼：把對話流切兩塊，穩定那塊貼 cache_control(1h)，讓快取斷點落在會動區之外。
 // 真實流量實測一發 $2.3459 → $0.7149（省 69.5%），所以預設開——不必人人自己去設環境變數。
 //
@@ -250,7 +250,7 @@ function toImageBlock(part) {
 // 官方明列的關鍵事實：`result` 欄位**只有 subtype === 'success' 時才存在**，
 // `error_max_turns` 那類根本沒有；`stop_reason: 'refusal'` 代表模型拒答。
 // 而我們設 maxTurns: 1 —— **模型只要想動一次工具就會撞 error_max_turns**，
-// 在酒館端長得跟拒答、跟真的沒話講一模一樣（綾 26-07-27 那個查不出病因的間歇性空回覆，
+// 在酒館端長得跟拒答、跟真的沒話講一模一樣（一位外部使用者 26-07-27 那個查不出病因的間歇性空回覆，
 // 這是候選解釋之一，而且解釋得通「為什麼間歇」：同一張卡有時模型想動工具、有時不想）。
 const EMPTY_REASONS = [
   {
@@ -275,7 +275,7 @@ const EMPTY_REASONS = [
     say: '這一則撞到費用上限被中止了。',
   },
   {
-    // 26-07-29 加：**空回覆的第一個確診病因＝登入憑證失效**（Anna 實案）。
+    // 26-07-29 加：**空回覆的第一個確診病因＝登入憑證失效**（外部使用者實案）。
     // 她的實況：`blocks=[無] subtype=success is_error=true usage=n/a cost=$0.0000`——
     // 模型一個字都沒吐、沒有 token 統計、沒扣費＝根本沒被呼叫成功；而她自己排除到
     // 「同一份 SDK 在自己程式裡跑正常，透過酒館全失敗，連 Haiku 都失敗」，最後查出是
@@ -307,7 +307,7 @@ const EMPTY_REASONS = [
   },
 ];
 
-// 空回覆時印出黑盒子，並回一句使用者看得懂的話取代空字串（26-07-27 綾案）。
+// 空回覆時印出黑盒子，並回一句使用者看得懂的話取代空字串（26-07-27 外部使用者案）。
 // 空字串在酒館裡跟「當機」長得一模一樣——沉浸感讓一步，換使用者知道發生什麼事。
 function emptyReplyNotice(reqNo, blockTypes, diag) {
   const parts = [`blocks=[${blockTypes.length ? blockTypes.join(',') : '無'}]`];
@@ -326,8 +326,8 @@ function emptyReplyNotice(reqNo, blockTypes, diag) {
       + '終端機視窗，找 “空回覆” 那一行——把那行貼給維護者，這是目前唯一的線索。可以先按重新生成試一次。）';
 }
 
-// SDK 回報錯誤時，把它給的東西整包印出來（26-07-29 加，Anna 案）。
-// 病史：Anna 回報 `blocks=[無] subtype=success is_error=true usage=n/a cost=$0`——
+// SDK 回報錯誤時，把它給的東西整包印出來（26-07-29 加，外部使用者案）。
+// 病史：外部使用者回報 `blocks=[無] subtype=success is_error=true usage=n/a cost=$0`——
 // 模型連一個字都沒吐、沒有 token 統計、沒扣費＝**根本沒開始生成**。而 `subtype=success`
 // 配 `is_error=true` 這個組合本身就矛盾，代表 SDK 有話要說，只是我們沒印。
 // 我們原本只收 subtype／num_turns／is_error 三個旗標，**把 SDK 放在 result 訊息裡的
@@ -471,7 +471,7 @@ async function readUsage(q) {
 // 做法：把送出去的內容切段，每段只記 SHA256 前 8 碼。兩輪一比，
 // 從第幾段開始雜湊不同，那段就是兇手。
 //
-// **只記雜湊不記原文**——Mini 的 RP 內容不落盤，這是紅線（同族：26-07-29
+// **只記雜湊不記原文**——使用者的 RP 內容不落盤，這是紅線（同族：26-07-29
 // 密鑰偵察全程用遮罩與指紋比對，不讓值進畫面就是不讓它進雲端）。
 // 預設關（`TCB_PREFIX_TRACE=1` 才開），因為它每輪都要寫檔。
 // 每段字元數。4000 是第一輪的粗掃粒度（22 段，夠定位到「哪一區」）；
@@ -669,7 +669,7 @@ function describeUsageShape(usage) {
 }
 
 // 執行環境指紋（啟動時印一次）。
-// 為什麼需要（Anna 26-07-29 案的直接教訓）：她自己測到「同一份 SDK、同樣參數，在她的程式裡
+// 為什麼需要（26-07-29 外部使用者案的直接教訓）：對方自己測到「同一份 SDK、同樣參數，在她的程式裡
 // 跑正常，**透過酒館就全失敗，連 Haiku 都失敗**」——差異只剩「跑在哪個進程裡」。
 // SDK 是靠 spawn `claude` 子程序工作的，所以 ST 進程的 node 版本、cwd、家目錄、
 // 有沒有自訂 CLAUDE_CONFIG_DIR，全都會影響它找不找得到 CLI 與登入憑證。
@@ -693,24 +693,24 @@ function renderTurn(m) {
   return `<${tag}>\n${m.content}\n</${tag}>`;
 }
 
-// 位置語義（26-07-27 大修，霽野裁定①）：
+// 位置語義（26-07-27 大修）：
 // 舊版把所有 role=system 不分位置一律搬進系統提示的最前面。酒館的注入是**帶位置的**——
 // 世界書 depth、作者註記、post-history 指令都靠位置生效，全部搬到最前面等於改寫了酒館的語義。
-// 實案：綾（外部使用者）94 則 system 有 93 則穿插在對話中間、最後一則也是 system，
-// 症狀＝不照格式輸出；Mini 側同病輕度（她 5 條 depth 注入裡的「導演指令 depth=1」被搬位，
-// 病徵是模型在思考裡手工重建該判定，霽野讀 jsonl 抓到現場）。
+// 實案：一位外部使用者的預設有 94 則 system、其中 93 則穿插在對話中間、最後一則也是 system，
+// 症狀＝不照格式輸出；另一位使用者同病輕度（5 條 depth 注入裡的「導演指令 depth=1」被搬位，
+// 病徵是模型在思考裡手工重建該判定，讀聊天記錄檔才抓到現場）。
 //
 // 核心規則：**header 區才是系統提示；對話開始之後的每一則 system 都留在它原本的位置。**
 // bridge 是橋，不是編輯。「header 到哪裡為止」的判準見下方兩段式說明。
 //
-// ── header 到哪裡為止：兩段式判準（26-07-27 第三版，綾兩份驗收報告逼出來的）──
+// ── header 到哪裡為止：兩段式判準（26-07-27 第三版，外部使用者兩份驗收報告逼出來的）──
 //
 // 判準一（嚴格，預設走這條）：開頭連續的 system，空白佔位訊息跳過不算數。
 //   涵蓋絕大多數預設。正常對話 `system…, user(第一句), assistant(回應)…` 完全正確。
 //
 // 判準二（救援，只在判準一拼不出系統提示卻確實有 system 訊息時啟用）：
 //   第一則 assistant 之前全歸 header。
-//   為什麼需要它：綾的預設把 `[PERSONA·STORYTELLER]` 和 `---` **指定為 user 角色**
+//   為什麼需要它：該使用者的預設把 `[PERSONA·STORYTELLER]` 和 `---` **指定為 user 角色**
 //   排在最前面（有實質內容，判準一在 index 0 就結束），結果 94 則 system 全落進
 //   對話流、系統提示是空的。她的 header 區長達 41 則且完全沒有 assistant——
 //   「角色說過話才代表對話開始了」在這種形狀下是可靠訊號。
@@ -719,7 +719,7 @@ function renderTurn(m) {
 //   無條件套用會把它吃進系統提示（實測打掉 7 組既有案例）。兩者無法用結構分辨，
 //   所以只在判準一確實失敗時才啟用救援，不拿正常情況去賭。
 //
-// 判準二的失效情形（綾自己指出）：整份沒有 assistant 時會吃掉玩家那句 → 退到
+// 判準二的失效情形（該使用者自己指出）：整份沒有 assistant 時會吃掉玩家那句 → 退到
 //   「最後一則 user 之前」保住它。
 function strictHeaderEnd(messages) {
   for (let i = 0; i < messages.length; i++) {
@@ -750,7 +750,7 @@ function parseMessages(messages) {
   return parseWithHeaderEnd(messages, rescueHeaderEnd(messages));
 }
 
-// ── 拆塊第一階：只量不動（26-08-02 承曦，CX-260802-03）────────────────
+// ── 拆塊第一階：只量不動（26-08-02）────────────────
 //
 // 為什麼先做一個「不改行為的量測模式」，而不是直接貼標記：
 //   斷點算錯的失效方式是**安靜的**——照樣有命中，只是少省一半，讀數看起來很正常。
@@ -853,7 +853,7 @@ function parseWithHeaderEnd(messages, headerEnd) {
     }
 
     // header 區：不管 role 是 system 還是 user 都併進系統提示——
-    // 那些是指令不是對話，酒館把它們標成 user 只是格式選擇（綾的預設實況）。
+    // 那些是指令不是對話，酒館把它們標成 user 只是格式選擇（外部使用者的預設實況）。
     if (!headerDone) {
       systemParts.push(content);
       continue;
@@ -870,7 +870,7 @@ function parseWithHeaderEnd(messages, headerEnd) {
   const systemPrompt = systemParts.filter(s => s.trim() !== '').join('\n\n') || undefined;
 
   // 當前訊息取「最後一則 **user**」，不是「最後一則」——depth=0 的注入會排在玩家發言之後，
-  // 舊版直接把它當成玩家現在說的話送出去（綾案：最後一則是 MVU 規則）。
+  // 舊版直接把它當成玩家現在說的話送出去（外部使用者案：最後一則是 MVU 規則）。
   let curIdx = -1;
   for (let i = flow.length - 1; i >= 0; i--) {
     if (flow[i].role === 'user') { curIdx = i; break; }
@@ -896,7 +896,7 @@ function parseWithHeaderEnd(messages, headerEnd) {
     const after = flow.slice(curIdx + 1);   // post-history：位置就是它的效力
 
     // 只帶最後一則 user 的圖：RP 用法是「丟一張圖→角色對它反應」，
-    // 整段歷史的圖全帶會讓長對話的 token 成本爆掉（26-07-25 Mini 拍板取捨）。
+    // 整段歷史的圖全帶會讓長對話的 token 成本爆掉（26-07-25 取捨）。
     images = cur.images || [];
 
     const parts = [];
@@ -1123,7 +1123,7 @@ async function handleChatCompletions(req, res) {
 
     // 有 system 訊息卻拼不出系統提示＝對話開頭就是使用者訊息，所有 system 都屬對話流。
     // 這是規則的正確行為（位置語義優先），但它讓「角色卡沒進系統提示」變成靜默狀態，
-    // 所以出一次聲（每次啟動只講一次，不洗版）——綾 26-07-27 驗收建議 (c)。
+    // 所以出一次聲（每次啟動只講一次，不洗版）——外部使用者 26-07-27 驗收建議 (c)。
     if (!systemPrompt && sysCount > 0 && !warnedNoSystemPrompt) {
       warnedNoSystemPrompt = true;
       console.warn(`[${PLUGIN_ID}] 注意：本次請求有 ${sysCount} 則系統訊息，但系統提示是空的——你的對話開頭是使用者訊息，所以每一則 system 都留在對話流的原位（位置語義優先）。角色扮演若不穩定，可從預設的訊息結構查起。此訊息每次啟動只出現一次。`);
@@ -1259,7 +1259,7 @@ async function handleChatCompletions(req, res) {
           splitApplied: splitInfo.applied,
         });
 
-        // 空回覆的黑盒子（26-07-27 綾案）：bridge 原本只記請求不記回應，
+        // 空回覆的黑盒子（26-07-27 外部使用者案）：bridge 原本只記請求不記回應，
         // 模型吐出一片空白時完全沒有線索，使用者只看得到「送出去、回來是空的」。
         // 這一行是分辨「模型拒答／產出非 text block／SDK 提前收尾」的唯一依據。
         if (!fullText.trim() && !ticket.aborted) {
@@ -1405,7 +1405,7 @@ async function handleChatCompletions(req, res) {
       });
 
       if (!ticket.aborted) {
-        // 整輪一個字都沒送出＝空回覆。印黑盒子，並補一則通知取代空白畫面（26-07-27 綾案）
+        // 整輪一個字都沒送出＝空回覆。印黑盒子，並補一則通知取代空白畫面（26-07-27 外部使用者案）
         if (!sentText) {
           const notice = makeChunk(completionId, modelId, { content: emptyReplyNotice(requestCount, blockTypes, diag) }, null);
           res.write(`data: ${JSON.stringify(notice)}\n\n`);
@@ -1520,8 +1520,8 @@ const info = {
   version: '1.3.0',
 };
 
-// 自我健檢：在**這個進程裡**實打一發最便宜的模型，驗 SDK 到底通不通（26-07-29 加，Anna 案）。
-// 為什麼要有：Anna 花了一整晚做排除法才確認「SDK 沒問題、參數沒問題、只有透過酒館才失敗」。
+// 自我健檢：在**這個進程裡**實打一發最便宜的模型，驗 SDK 到底通不通（26-07-29 加，外部使用者案）。
+// 為什麼要有：一位外部使用者花了一整晚做排除法才確認「SDK 沒問題、參數沒問題、只有透過酒館才失敗」。
 // 那份排除本來該由這支橋自己回答——它就跑在那個進程裡，最有資格說「我在這裡叫不叫得動 SDK」。
 // 不自動跑（會燒額度），由使用者從面板或 curl 主動觸發。
 async function runSelfTest() {
@@ -1553,7 +1553,7 @@ async function runSelfTest() {
     if (text.trim()) {
       return { ok: true, stage: 'done', ms, reply: text.trim().slice(0, 40), message: `通了（${ms}ms）——SDK 在 SillyTavern 這個進程裡叫得動，問題不在環境。` };
     }
-    // 這裡才是 Anna 那個症狀：跑完了、但一個字都沒有
+    // 這裡才是那個症狀：跑完了、但一個字都沒有
     return {
       ok: false, stage: 'empty', ms,
       blocks, subtype: result?.subtype, is_error: result?.is_error,
