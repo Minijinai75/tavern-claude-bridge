@@ -118,11 +118,20 @@ Write-OK "前端擴充已安裝"
 Write-Step 4 "複製 Server Plugin"
 
 $sourceDir = Join-Path $frontendDir "server\tavern-claude-bridge"
-if (-not (Test-Path (Join-Path $sourceDir "index.mjs"))) {
-    Write-Err "找不到 server plugin 的來源檔案"
-    Write-Host "    -> $sourceDir 裡沒有 index.mjs"
-    Write-Host "    -> 可能是擴充版本太舊，到酒館擴充面板更新 Claude Bridge 後再試"
-    exit 1
+
+# server plugin 要複製哪些檔案。**新增模組時只改這一行。**
+# 26-08-03 的教訓：cache-breakpoint.mjs 被 index.mjs import 之後，這裡沒跟著加，
+# 安裝完會缺檔、橋直接起不來——而症狀是「裝好了但擴充面板說 plugin 沒啟用」，
+# 使用者完全看不出是少了一個檔。所以改成清單驅動，而且逐檔檢查、缺一個就停。
+$pluginFiles = @("index.mjs", "cache-breakpoint.mjs", "package.json")
+
+foreach ($f in $pluginFiles) {
+    if (-not (Test-Path (Join-Path $sourceDir $f))) {
+        Write-Err "找不到 server plugin 的來源檔案"
+        Write-Host "    -> $sourceDir 裡沒有 $f"
+        Write-Host "    -> 可能是擴充版本太舊，到酒館擴充面板更新 Claude Bridge 後再試"
+        exit 1
+    }
 }
 
 $pluginsDir = Join-Path $stDir "plugins"
@@ -135,12 +144,16 @@ if (-not (Test-Path $targetDir)) {
     New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
 }
 
-Copy-Item (Join-Path $sourceDir "index.mjs") (Join-Path $targetDir "index.mjs") -Force
-Copy-Item (Join-Path $sourceDir "package.json") (Join-Path $targetDir "package.json") -Force
+foreach ($f in $pluginFiles) {
+    Copy-Item (Join-Path $sourceDir $f) (Join-Path $targetDir $f) -Force
+}
 
-if (-not (Test-Path (Join-Path $targetDir "index.mjs")) -or -not (Test-Path (Join-Path $targetDir "package.json"))) {
-    Write-Err "複製失敗: plugins\tavern-claude-bridge\ 裡缺少 index.mjs 或 package.json"
-    exit 1
+# 寫入之後一定要回頭查目標狀態——「複製指令沒報錯」不等於「檔案在那裡」
+foreach ($f in $pluginFiles) {
+    if (-not (Test-Path (Join-Path $targetDir $f))) {
+        Write-Err "複製失敗: plugins\tavern-claude-bridge\ 裡缺少 $f"
+        exit 1
+    }
 }
 
 if (Test-Path (Join-Path $targetDir "manifest.json")) {

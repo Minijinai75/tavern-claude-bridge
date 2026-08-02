@@ -99,6 +99,51 @@
   text-decoration: underline;
 }
 
+/* 快取效果數據卡。做成獨立一塊有兩個理由：使用者會截圖回報（要一眼框得住），
+   以及它是「本次啟動以來」的暫時數字，跟上面的常態狀態不同性質，不該混在一起。 */
+.tcb-cache:empty {
+  display: none;
+}
+
+.tcb-cache {
+  font-size: 0.88em;
+  white-space: pre-line;
+  line-height: 1.55;
+  padding: 6px 9px;
+  border-radius: 4px;
+  background: rgba(76, 175, 80, 0.1);
+  border-left: 3px solid #4caf50;
+}
+
+/* 第一行是整塊的主角：這一則比上一則便宜多少。其餘都是細節，字級要退下去。 */
+.tcb-cache-headline {
+  font-size: 1.08em;
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
+.tcb-cache details {
+  margin-top: 6px;
+}
+
+.tcb-cache summary {
+  cursor: pointer;
+  font-size: 0.85em;
+  opacity: 0.8;
+}
+
+.tcb-cache-note {
+  display: block;
+  font-size: 0.82em;
+  opacity: 0.72;
+  margin-top: 4px;
+  white-space: normal;
+}
+
+.tcb-cache button {
+  margin-top: 6px;
+}
+
 .tcb-disclaimer {
   font-size: 0.82em;
   opacity: 0.7;
