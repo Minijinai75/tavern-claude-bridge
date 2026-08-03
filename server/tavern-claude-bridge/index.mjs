@@ -281,17 +281,28 @@ const EMPTY_REASONS = [
     // 不要讓它掉進下面那條「兩種可能」的通用條目，那條要人自己去查。
     // 同族前例：26-08-02 撞到 SDK 對 API 400 也不丟例外、照樣回全 0 的 result。
     //
-    // ⚠️ **誠實邊界：這一條還沒被真實案例驗證過。** 回報者給的黑盒子裡沒有 result 欄位的
-    // 內容，所以「SDK 在額度用盡時會不會在 result 帶文字」是我的推測，不是實測。
-    // 帶得出來就自動分流；帶不出來就掉到下面那條並列版——**真正的防線是下面那條**，
-    // 它不依賴任何假設。把 resultText 印進黑盒子就是為了下次有人回報時能一眼確認這件事。
+    // ✅ **26-08-03 12:00 已實測**（外部使用者在額度用盡的當下實跑並回報原文）：
+    //    `result="You've hit your session limit · resets 4:10pm (Asia/Taipei)"`
+    //    推測對一半——SDK **確實**會帶出錯誤文字（第一版推測成立），
+    //    但**字樣不是我猜的那些**：它寫 `session limit`，不是 rate limit／usage limit／quota，
+    //    所以第一版的正則整條抓不到、自動分流沒觸發，使用者拿到的是下面那條並列版。
+    //    這正好證明「真正的防線是並列那條」——它不依賴任何字樣假設，救了這一場。
+    //    教訓：**猜得到「有沒有」不代表猜得到「長什麼樣」**，字串比對的條件一定要拿真樣本校準。
+    //    另一個意外收穫：那段文字自帶**重置時間**，比叫人去翻 Settings 有用得多，直接轉給使用者。
     match: d => typeof d.resultText === 'string'
-      && /rate.?limit|quota|exceeded|too.?many|usage.?limit|額度/i.test(d.resultText),
+      && /rate.?limit|quota|exceeded|too.?many|usage.?limit|session.?limit|hit your.{0,20}limit|額度/i.test(d.resultText),
     label: '額度用完了',
-    say: '這一則沒送出去——Claude 回報額度已達上限。重新生成不會有幫助，'
-      + '等額度回補（訂閱是滾動窗口，過一陣子會自己回來），或先換便宜一點的模型繼續。'
-      + '到 claude.ai 的 Settings → Usage 可以看還剩多少、什麼時候重置。'
-      + '**這跟登入憑證無關，不用重新登入。**',
+    say: d => {
+      // 從 SDK 原文抽重置時間（實測樣本：「· resets 4:10pm (Asia/Taipei)」）
+      const m = /resets?\s+([^"\n·]+)/i.exec(d.resultText || '');
+      const 重置 = m ? m[1].trim() : null;
+      return '這一則沒送出去——Claude 回報額度已達上限，重新生成不會有幫助。'
+        + (重置
+          ? `**${重置} 就會重置**，到時候直接繼續玩就好。`
+          : '訂閱額度是滾動窗口，過一陣子會自己回來；到 claude.ai 的 Settings → Usage 可以看什麼時候重置。')
+        + '想現在就繼續的話，換便宜一點的模型（Sonnet／Haiku）通常還有額度。'
+        + '**這跟登入憑證無關，不用重新登入。**';
+    },
   },
   {
     // 26-07-29 加：**空回覆的第一個確診病因＝登入憑證失效**（外部使用者實案）。
@@ -375,8 +386,10 @@ function emptyReplyNotice(reqNo, blockTypes, diag) {
   }
 
   // 認得出成因就直說並給路；認不出才回原本那句保守的話（不要假裝知道）
+  // say 可以是字串或函式——函式版拿得到 diag，用來把 SDK 原文裡的線索
+  // （例如額度的重置時間）轉給使用者，那比叫人自己去翻設定頁有用得多
   return hit
-    ? `（${hit.label}）${hit.say}`
+    ? `（${hit.label}）${typeof hit.say === 'function' ? hit.say({ ...diag, blockTypes }) : hit.say}`
     : '（這一則模型沒有產出任何文字，而且成因不在已知清單裡。診斷資訊已印在 SillyTavern 的'
       + '終端機視窗，找 “空回覆” 那一行——把那行貼給維護者，這是目前唯一的線索。可以先按重新生成試一次。）';
 }
