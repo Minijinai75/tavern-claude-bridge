@@ -275,6 +275,25 @@ const EMPTY_REASONS = [
     say: '這一則撞到費用上限被中止了。',
   },
   {
+    // 26-08-03 加（外部使用者回報）：**額度用盡時 SDK 不拋例外**，它回一個帶 is_error 的
+    // result，所以整條 humanError() 的 rate_limit 分支繞過去了（那條只在拋例外時走得到）。
+    // 唯一能自動分辨的線索是 result 自己帶的那段文字——有寫額度就直接判額度，
+    // 不要讓它掉進下面那條「兩種可能」的通用條目，那條要人自己去查。
+    // 同族前例：26-08-02 撞到 SDK 對 API 400 也不丟例外、照樣回全 0 的 result。
+    //
+    // ⚠️ **誠實邊界：這一條還沒被真實案例驗證過。** 回報者給的黑盒子裡沒有 result 欄位的
+    // 內容，所以「SDK 在額度用盡時會不會在 result 帶文字」是我的推測，不是實測。
+    // 帶得出來就自動分流；帶不出來就掉到下面那條並列版——**真正的防線是下面那條**，
+    // 它不依賴任何假設。把 resultText 印進黑盒子就是為了下次有人回報時能一眼確認這件事。
+    match: d => typeof d.resultText === 'string'
+      && /rate.?limit|quota|exceeded|too.?many|usage.?limit|額度/i.test(d.resultText),
+    label: '額度用完了',
+    say: '這一則沒送出去——Claude 回報額度已達上限。重新生成不會有幫助，'
+      + '等額度回補（訂閱是滾動窗口，過一陣子會自己回來），或先換便宜一點的模型繼續。'
+      + '到 claude.ai 的 Settings → Usage 可以看還剩多少、什麼時候重置。'
+      + '**這跟登入憑證無關，不用重新登入。**',
+  },
+  {
     // 26-07-29 加：**空回覆的第一個確診病因＝登入憑證失效**（外部使用者實案）。
     // 她的實況：`blocks=[無] subtype=success is_error=true usage=n/a cost=$0.0000`——
     // 模型一個字都沒吐、沒有 token 統計、沒扣費＝根本沒被呼叫成功；而她自己排除到
@@ -290,10 +309,18 @@ const EMPTY_REASONS = [
       && (d.subtype === 'success' || d.subtype === undefined)
       && Array.isArray(d.blockTypes) && d.blockTypes.length === 0
       && (d.costUsd === 0 || d.costUsd === undefined),
-    label: '模型沒被叫起來（多半是登入憑證）',
-    say: '模型一個字都沒吐、也沒有任何用量——通常是 Claude Code 的登入憑證過期或沒更新成功，'
-      + '重新生成不會有幫助。請到終端機執行 `claude login` 重新登入，然後**重啟 SillyTavern**（憑證是啟動時載入的）。'
-      + '想直接確認的話，在擴充面板按「自我健檢」，它會在酒館這個進程裡實打一發告訴你通不通。',
+    // 26-08-03 修（外部使用者回報，v1.6.0 那版的說法會誤導）：
+    // **同一個指紋至少對應兩種病因**——他的案例憑證完全正常，是訂閱額度用完。
+    // 舊版單指憑證，會把人導去重新登入白忙一場；更糟的是舊版還叫人「按自我健檢確認」，
+    // 而額度用完時健檢那一發同樣撞牆失敗，看起來更像憑證壞了。
+    // 這裡不猜、兩種並列，並告訴使用者先查哪一個——處置完全不同（等回補 vs 重新登入）。
+    label: '模型沒被叫起來（額度用盡或憑證失效）',
+    say: '模型一個字都沒吐、也沒有任何用量——請求根本沒被送出去，重新生成不會有幫助。'
+      + '兩種可能，先查第一個：\n'
+      + '① **訂閱額度用完**——到 claude.ai 的 Settings → Usage 看還剩多少；等額度回補，或先換便宜一點的模型。\n'
+      + '② **登入憑證過期或沒更新成功**——在終端機執行 `claude login`，然後**重啟 SillyTavern**（憑證是啟動時載入的）。\n'
+      + '注意：面板的「自我健檢」在額度用完時同樣會失敗，所以它只能證明「現在不通」，'
+      + '不能證明是憑證的錯——額度沒滿才往憑證查。',
   },
   {
     match: d => d.subtype === 'error_during_execution' || d.is_error === true,
@@ -314,6 +341,9 @@ function emptyReplyNotice(reqNo, blockTypes, diag) {
   for (const k of ['stop_reason', 'subtype', 'num_turns', 'is_error']) {
     if (diag[k] !== undefined) parts.push(`${k}=${diag[k]}`);
   }
+  // result 自己帶的文字要印出來——它是「額度用盡」與「憑證失效」唯一的分辨線索，
+  // 不印的話下一個人只能看著兩個同形的指紋猜（26-08-03 外部使用者案的直接教訓）
+  if (diag.resultText) parts.push(`result="${diag.resultText.replace(/\s+/g, ' ').slice(0, 120)}"`);
 
   const hit = EMPTY_REASONS.find(r => r.match({ ...diag, blockTypes }));
   const label = hit ? hit.label : '成因不明';
@@ -1231,6 +1261,10 @@ async function handleChatCompletions(req, res) {
             diag.subtype = msg.subtype;
             diag.num_turns = msg.num_turns;
             diag.is_error = msg.is_error;
+            // result 自己帶的文字（26-08-03 加，外部使用者回報後補）：額度用盡時 SDK
+            // **不拋例外**、照樣回一個 result，指紋跟憑證失效一模一樣——唯一能分辨的
+            // 線索就在這段文字裡。沒有它，兩種病因在畫面上完全同形。
+            if (typeof msg.result === 'string' && msg.result.trim()) diag.resultText = msg.result.slice(0, 300);
             dumpResultOnError(requestCount + 1, msg);   // 出錯才印，正常路徑零噪音
             break; // 串流輸入模式不會自己收尾（SDK 等下一則輸入），拿到 result 就走
           }
@@ -1382,6 +1416,8 @@ async function handleChatCompletions(req, res) {
           diag.subtype = msg.subtype;
           diag.num_turns = msg.num_turns;
           diag.is_error = msg.is_error;
+          // 同上（串流路徑）——兩條路徑都要帶，只改一份等於真實情境永遠拿不到線索
+          if (typeof msg.result === 'string' && msg.result.trim()) diag.resultText = msg.result.slice(0, 300);
           dumpResultOnError(requestCount + 1, msg);   // 出錯才印，正常路徑零噪音
           break; // 串流輸入模式不會自己收尾，拿到 result 就走
         }
@@ -1558,8 +1594,10 @@ async function runSelfTest() {
       ok: false, stage: 'empty', ms,
       blocks, subtype: result?.subtype, is_error: result?.is_error,
       raw: result ? JSON.stringify(result).slice(0, 800) : null,
-      message: '❌ SDK 在這個進程裡叫得動、但模型一個字都沒吐——這是環境層問題不是設定問題。'
-        + '把這整段連同上面那行「執行環境：…」貼給維護者。',
+      message: '❌ SDK 在這個進程裡叫得動、但模型一個字都沒吐。兩種可能，先查第一個：'
+        + '① **訂閱額度用完**（到 claude.ai → Settings → Usage 看一眼，健檢這一發同樣會撞額度，'
+        + '所以健檢失敗不等於憑證壞了）② **登入憑證失效**（終端機 `claude login` 後重啟 SillyTavern）。'
+        + '兩個都不是的話，把這整段連同上面那行「執行環境：…」貼給維護者。',
     };
   } catch (err) {
     return {
