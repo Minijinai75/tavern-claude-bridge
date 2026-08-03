@@ -349,6 +349,31 @@ function emptyReplyNotice(reqNo, blockTypes, diag) {
   const label = hit ? hit.label : '成因不明';
   console.warn(`[${PLUGIN_ID}][${reqNo}] ⚠️ 空回覆（${label}） — ${parts.join(' ')}`);
 
+  // 落檔（26-08-03 加）。**這條的立案理由值得寫下來**：
+  // 空回覆最常見的病因之一是額度用盡，而額度用盡的那一刻，使用者的 AI 助手往往
+  // 同樣動不了——「請你下次撞到時把終端機那行貼給我」在最需要的當下剛好做不到。
+  // 所以不要靠人在慌亂時抄，讓橋自己留下來：額度回來之後誰都撈得到，事後補證一樣算數。
+  // 只存結構不存內容（同 turn-log 的紀律）：診斷欄位、成因判定、result 那段文字，
+  // 沒有任何一句對話。上限與 turn-log 同一套，超過就只留最後 200 筆。
+  try {
+    const file = path.join(__dirname, 'empty-replies.jsonl');
+    try {
+      if (fs.statSync(file).size > TURN_LOG_MAX_BYTES) {
+        fs.writeFileSync(file, fs.readFileSync(file, 'utf8').split('\n').slice(-200).join('\n'), 'utf8');
+      }
+    } catch {}
+    fs.appendFileSync(file, JSON.stringify({
+      t: new Date().toISOString(), n: reqNo, label,
+      blocks: blockTypes, stop_reason: diag.stop_reason, subtype: diag.subtype,
+      num_turns: diag.num_turns, is_error: diag.is_error, costUsd: diag.costUsd,
+      // 這格就是「額度用盡 vs 憑證失效」的分辨依據——沒有它，兩種病因在事後完全同形
+      resultText: diag.resultText ?? null,
+    }) + '\n', 'utf8');
+  } catch (e) {
+    // 不靜默吞：落檔壞掉會讓「事後撈得到」變成空頭支票，而那正是這段存在的理由
+    console.warn(`[${PLUGIN_ID}] 空回覆落檔失敗：${String((e && e.message) || e).slice(0, 120)}`);
+  }
+
   // 認得出成因就直說並給路；認不出才回原本那句保守的話（不要假裝知道）
   return hit
     ? `（${hit.label}）${hit.say}`
