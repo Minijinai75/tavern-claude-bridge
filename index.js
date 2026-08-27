@@ -2,7 +2,7 @@ const PLUGIN_ID = 'tavern-claude-bridge';
 const API_BASE = `/api/plugins/${PLUGIN_ID}`;
 const UI_PREFIX = 'tcb';
 const SETTINGS_KEY = 'tavern_claude_bridge';
-const LOCAL_VERSION = '1.7.3';
+const LOCAL_VERSION = '1.7.5';
 const GITHUB_RELEASE_API = 'https://api.github.com/repos/Minijinai75/tavern-claude-bridge/releases/latest';
 let updateCache;
 
@@ -270,7 +270,7 @@ function buildPanel() {
         const 漂 = document.createElement('div');
         漂.className = `${UI_PREFIX}-cache-warn`;
         漂.textContent = '⚠️ 你的系統提示每則都在變（角色卡＋預設組出來的那一大段）。'
-          + '它排在對話前面，一變整包快取就作廢——**拆塊救不了這種**。'
+          + '它排在對話前面，一變整包快取就作廢——拆塊救不了這種。'
           + '常見來源：世界書的關鍵字觸發條目（綠燈）、每則重算的注入、時間戳。'
           + '修法是把那些東西挪到對話尾端的會動區（世界書條目改成 @D 深度插入）。';
         cacheEl.appendChild(漂);
@@ -356,6 +356,18 @@ function buildPanel() {
         '3. config.yaml 已設 enableServerPlugins: true\n' +
         '4. 已重啟 SillyTavern';
       return;
+    }
+
+    // 前端更新了、server plugin 沒換——**這是最常見的更新失敗，而且完全無聲**
+    // （26-08-27 實案：使用者更新完跑了一則，才發現診斷根本沒出來，白花額度）。
+    // 面板換的是這個檔，橋的本體要跑 install.ps1 才會換，兩邊版本一比就抓得到。
+    if (result.version && result.version !== LOCAL_VERSION) {
+      const 版 = document.createElement('div');
+      版.className = `${UI_PREFIX}-cache-warn`;
+      版.textContent = `⚠️ 前端是 ${LOCAL_VERSION}，但橋的本體還是 ${result.version}——`
+        + '更新只做了一半。請重跑 install.ps1，然後重開 SillyTavern。'
+        + '（面板更新只換前端；橋的本體在 plugins 資料夾，要跑腳本才會換，而它是啟動時載入的。）';
+      infoEl.appendChild(版);
     }
 
     if (!result.sdkAvailable) {

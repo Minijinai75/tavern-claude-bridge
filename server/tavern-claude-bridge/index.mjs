@@ -173,7 +173,7 @@ function splitWarningOf(t) {
   const 位置 = typeof t.lastDivergence === 'number'
     ? `｜量到的變動點在第 ${t.lastDivergence} 則`
       + (t.lastDivergenceZone === 'system'
-          ? '，它落在**系統提示區**——拆塊救不了這種，要去找是誰在每則重算那一段'
+          ? '，它落在「系統提示區」——拆塊救不了這種，要去找是誰在每則重算那一段'
           : t.lastDivergenceZone === 'chat'
             ? '，落在對話區——通常是會回頭改寫舊訊息的機制'
             : '')
@@ -843,13 +843,31 @@ function renderTurn(m) {
 //
 // 判準二的失效情形（該使用者自己指出）：整份沒有 assistant 時會吃掉玩家那句 → 退到
 //   「最後一則 user 之前」保住它。
+/**
+ * 這則訊息「實質上是空的」嗎？——三種格式都要看得懂。
+ * 有圖片就不算空（圖片本身就是內容）；文字塊陣列要看塊裡的文字。
+ */
+function blankContent(content) {
+  if (typeof content === 'string') return content.trim() === '';
+  if (Array.isArray(content)) {
+    if (content.some(p => p && p.type === 'image_url')) return false;
+    return !content.some(p => p && typeof p.text === 'string' && p.text.trim() !== '');
+  }
+  return content == null ? true : String(content).trim() === '';
+}
+
 function strictHeaderEnd(messages) {
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
     if (!m) continue;
     if (m.role === 'system') continue;
-    const c = typeof m.content === 'string' ? m.content : '';
-    const isBlank = c.trim() === '' && !(Array.isArray(m.content) && m.content.some(p => p?.type === 'image_url'));
+    // 「空白」要看得懂三種格式，不然對話開頭會被誤判成 header（26-08-27 實案）：
+    //   字串／文字塊陣列／含圖片的陣列。舊版只認字串，**分塊格式的訊息一律當成空白跳過**，
+    //   headerEnd 因此一路往後跑，真實對話的開頭被吃進系統提示區——
+    //   使用者看到的「歷史只有 5 則」不是他對話短，是這裡認錯了地方。
+    //   抓到它的方式：同一則訊息，這裡當它空白、describeDivergentTurn 卻算得出 56 字元。
+    //   **兩支函式對同一份資料判定不一致，就是有一支錯了。**
+    const isBlank = blankContent(m.content);
     if (isBlank) continue;      // 空白佔位不算對話開始
     return i;
   }
@@ -1087,13 +1105,13 @@ export function describeDivergentTurn(messages, divergence, headerEnd) {
   const 在系統區 = divergence < 界;
 
   const 位置說明 = 在系統區
-    ? `它落在**系統提示區**（前 ${界} 則：角色卡、預設各條目、世界書常駐那些）——`
-      + `**拆塊救不了這種**，因為拆塊只切對話那一段，而這一則排在對話前面，`
+    ? `它落在「系統提示區」（前 ${界} 則：角色卡、預設各條目、世界書常駐那些）——`
+      + `拆塊救不了這種，因為拆塊只切對話那一段，而這一則排在對話前面，`
       + `它一變、後面整包作廢。要修得去關掉是誰在每則重算它`
-    : `它落在**對話區**（第 ${divergence - 界} 則對話）——`
+    : `它落在「對話區」（第 ${divergence - 界} 則對話）——`
       + `通常是會回頭改寫舊訊息的機制（狀態欄寫回、變數系統更新舊樓）`;
 
-  return `｜**第 ${divergence} 則是 role=${role}、長度 ${len} 字元**——${位置說明}`;
+  return `｜第 ${divergence} 則是 role=${role}、長度 ${len} 字元——${位置說明}`;
 }
 
 function splitPromptBlocks(parsed, cut, modelId) {
@@ -1362,7 +1380,7 @@ async function handleChatCompletions(req, res) {
         const 變動位置 = div === null || div === undefined
           ? ''
           : `｜量到的變動點在第 ${div} 則（距離最新第 ${Math.max(0, messages.length - div)} 則）`
-            + `——**每則都有東西在改這個位置之前的內容**，快取因此整包作廢。`
+            + `——每則都有東西在改這個位置之前的內容，快取因此整包作廢。`
             + `常見來源：會把狀態寫回舊訊息的變數系統、每則重算的深度注入、系統提示裡的時間戳`
             + 首則;
         splitInfo.divergence = div ?? null;
@@ -1738,11 +1756,23 @@ function startBridge(port) {
   });
 }
 
+// 版本號的唯一來源是 package.json——**不要在這裡寫第二個**（26-08-27）。
+// 這格原本寫死 '1.3.0'，從 v1.3.0 起就沒人動過，而套件已經到 1.7.x。
+// 危險的不是數字錯，是它讓「前端比對前後端版本」這個最自然的防呆做不成，
+// 而那正是使用者踩的坑：面板更新了、server plugin 沒換，症狀完全無聲。
+function readOwnVersion() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || '0.0.0';
+  } catch {
+    return '0.0.0';   // 讀不到就明說是 0.0.0，不要瞎編一個看起來像真的的版本
+  }
+}
+
 const info = {
   id: PLUGIN_ID,
   name: 'Claude Bridge',
   description: 'Bridges SillyTavern to Claude via official Agent SDK and local subscription auth.',
-  version: '1.3.0',
+  version: readOwnVersion(),
 };
 
 // 自我健檢：在**這個進程裡**實打一發最便宜的模型，驗 SDK 到底通不通（26-07-29 加，外部使用者案）。
