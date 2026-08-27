@@ -1104,6 +1104,10 @@ export function describeDivergentTurn(messages, divergence, headerEnd) {
   const 界 = Number.isFinite(headerEnd) ? headerEnd : 0;
   const 在系統區 = divergence < 界;
 
+  // 內容開頭：位置會漂、長度認不出來，這才是使用者真正能拿去比對的線索
+  const 頭 = contentHead(m.content);
+  const 片段 = 頭 ? `、開頭：「${頭}」` : '';
+
   const 位置說明 = 在系統區
     ? `它落在「系統提示區」（前 ${界} 則：角色卡、預設各條目、世界書常駐那些）——`
       + `拆塊救不了這種，因為拆塊只切對話那一段，而這一則排在對話前面，`
@@ -1111,7 +1115,30 @@ export function describeDivergentTurn(messages, divergence, headerEnd) {
     : `它落在「對話區」（第 ${divergence - 界} 則對話）——`
       + `通常是會回頭改寫舊訊息的機制（狀態欄寫回、變數系統更新舊樓）`;
 
-  return `｜第 ${divergence} 則是 role=${role}、長度 ${len} 字元——${位置說明}`;
+  return `｜第 ${divergence} 則是 role=${role}、長度 ${len} 字元${片段}——${位置說明}`;
+}
+
+/**
+ * 取內容開頭當「認得出來」的線索（26-08-27 深夜，外部使用者親自抓到的缺陷）。
+ *
+ * 為什麼要打破原本「完全不碰內容」的隱私線：使用者回報同一條東西，
+ * 第 2 則時是「第 17 條」、第 3 則跑到「第 32 條」——**位置每則都在漂**
+ * （前面某塊長度一變，後面全部推移），而我一整晚拿它當座標報給人。
+ * 她照著找到的當然是別的東西，於是「你說它在長大／我看它沒在動」兩邊各說各話。
+ * 位置不可用、長度＋role 也認不出來，**不給片段就等於沒有可操作的線索**。
+ *
+ * 三個限制讓這條線放得住：
+ *   ① 只取開頭 30 字——足夠認出是哪一條，不足以還原 RP 內容
+ *   ② 壓成單行——否則一則長訊息會把 log 撐爛
+ *   ③ 只出現在使用者自己機器的終端機與面板，不上傳、不落遠端
+ */
+function contentHead(content, max = 30) {
+  const raw = typeof content === 'string' ? content
+    : Array.isArray(content) ? content.map(p => (p && typeof p.text === 'string') ? p.text : '').join('')
+    : '';
+  const flat = raw.replace(/\s+/g, ' ').trim();
+  if (!flat) return '';
+  return flat.length > max ? flat.slice(0, max) + '…' : flat;
 }
 
 function splitPromptBlocks(parsed, cut, modelId) {
