@@ -2,7 +2,7 @@ const PLUGIN_ID = 'tavern-claude-bridge';
 const API_BASE = `/api/plugins/${PLUGIN_ID}`;
 const UI_PREFIX = 'tcb';
 const SETTINGS_KEY = 'tavern_claude_bridge';
-const LOCAL_VERSION = '1.6.3';
+const LOCAL_VERSION = '1.7.0';
 const GITHUB_RELEASE_API = 'https://api.github.com/repos/Minijinai75/tavern-claude-bridge/releases/latest';
 let updateCache;
 
@@ -252,6 +252,17 @@ function buildPanel() {
     }
 
     cacheEl.append(`\n玩了 ${c.requests} 則，總共 ${元(c.costUsd)}（重開 SillyTavern 會歸零）`);
+
+    // 拆塊開著卻沒生效——**放第一層，不收摺疊**（26-08-27，v1.7.0）。
+    // 這次的 bug 活了很久不是因為難查，是因為它安靜：面板照樣寫「拆塊：開著」，
+    // 唯一線索是摺疊區裡那行「N 則裡有 M 則拆到塊」，沒有人會去展開它。
+    // 修掉根因不等於下次不會有別的原因讓它失效，所以留一個會自己叫的東西。
+    if (c.splitWarning) {
+      const 警 = document.createElement('div');
+      警.className = `${UI_PREFIX}-cache-warn`;
+      警.textContent = `⚠️ ${c.splitWarning.text}`;
+      cacheEl.appendChild(警);
+    }
 
     // ── 細節收進摺疊：回報用的證據，不是給人讀的第一句 ──────────────
     const 細節 = document.createElement('details');

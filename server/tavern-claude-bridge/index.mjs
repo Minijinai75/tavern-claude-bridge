@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 // 拆塊斷點掃描器（26-08-02，CX-260802-03）：只做「斷點該落在哪一則」的計算，
 // 不碰渲染也不貼標記——分工線在那支的檔頭註解。目前只被量測模式用到。
-import { fingerprintTurns, decideBreakpoint, stickyBreakpoint } from './cache-breakpoint.mjs';
+import { fingerprintTurns, decideBreakpoint, stickyBreakpoint, meetsCacheMinimum, estimateTokens, minCacheTokensFor } from './cache-breakpoint.mjs';
 
 // ESM 沒有 __dirname，自己算（快取讀數落檔要用——見 appendCacheLog）
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -110,6 +110,7 @@ const cacheTally = {
   // 而那正是最需要被說服的時刻。**單則對照才是人看得懂的那個數字**，而且第三則就成立。
   lastCostUsd: 0,
   prevCostUsd: 0,
+  lastSkipReason: null,   // 最近一次「這發不拆」的理由（面板警告靠它把「沒生效」講成「為什麼」）
 };
 
 // 「沒有快取的話要付幾倍」——純比例換算，不需要任何價目表。
@@ -133,6 +134,39 @@ function cacheSummary(t = cacheTally) {
     savedPct: t.requests >= 2 && t.prevCostUsd > 0
       ? Math.round((1 - t.lastCostUsd / t.prevCostUsd) * 100)
       : null,
+    // 拆塊開著卻幾乎沒生效時，**要在面板第一層講出來**（26-08-27，CX-260827-01 第三刀）。
+    //
+    // 為什麼加這一格：這次的 bug 之所以能活這麼久，不是因為它難查，是因為它**安靜**——
+    // 面板照樣顯示「拆塊：開著」，唯一的線索是摺疊區裡一行「66 則裡有 4 則拆到塊」，
+    // 三位外部使用者付了幾十倍的錢，沒有一個人看得出哪裡不對。修好這次的根因不等於
+    // 下次不會再有別的原因讓它失效，所以要留一個**會自己叫的東西**。
+    //
+    // 三條不叫的情況：沒樣本、使用者自己關掉（那是他的選擇不是故障）、拆塊率健康。
+    splitWarning: splitWarningOf(t),
+  };
+}
+
+/**
+ * 拆塊「開著但沒生效」的警告。回 null＝沒事，不要吵。
+ *
+ * 門檻取「一半」是刻意的鈍值：拆塊本來就有合理不拆的時候（第一發沒基準、
+ * 斷點剛好在頭幾則），偶爾不拆不是病；**長期過半不拆才是**。
+ */
+function splitWarningOf(t) {
+  const 樣本夠 = t.requests >= 3;
+  // 帳本沒帶這欄就問即時狀態（production 走這條）；測試傳假帳本時可以覆寫。
+  const 開著 = t.splitEnabled !== undefined ? t.splitEnabled !== false : splitEnabled();
+  if (!樣本夠 || !開著) return null;
+  const applied = t.splitApplied || 0;
+  if (applied * 2 >= t.requests) return null;     // 過半有拆到＝健康
+
+  const 原因 = t.lastSkipReason
+    ? `最近一次的原因是：${t.lastSkipReason}`
+    : '這次啟動還沒記到不拆的原因（重開過的話再玩幾則就會有）';
+  return {
+    level: 'warn',
+    text: `拆塊開著，但 ${t.requests} 則裡只有 ${applied} 則真的拆到塊——`
+        + `省快取這件事現在幾乎沒有在發生。${原因}`,
   };
 }
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
@@ -654,6 +688,8 @@ function recordUsage(usage, ctx) {
   if (usage) {
     cacheTally.requests++;
     if (ctx.splitApplied) cacheTally.splitApplied++;
+    // 不拆的理由要留最後一筆——面板的警告靠它把「沒生效」講成「為什麼沒生效」。
+    else if (ctx.splitReason) cacheTally.lastSkipReason = ctx.splitReason;
     cacheTally.input += inTok;
     cacheTally.cacheRead += cacheRead;
     cacheTally.cacheWrite += cacheWrite;
@@ -1005,7 +1041,7 @@ export function cutFromMessageIndex(historyMsgIdx, breakpointMsgIdx) {
 // ttl 一律帶 '1h'：手動標記預設 5m，而 SDK 會在最後一塊自己補 1h，
 // API 規定 1h 不得排在 5m 之後 → 整組 400（26-08-02 實測，request-018 為證）。
 // 這條是結構必然不是經驗法則：SDK 補的位置永遠在我們後面。
-function splitPromptBlocks(parsed, cut) {
+function splitPromptBlocks(parsed, cut, modelId) {
   const turns = parsed && parsed.historyTurns;
   if (!Array.isArray(turns) || turns.length === 0) return null;
   if (!(cut > 0) || cut >= turns.length) return null;   // 沒東西可切或整段都算穩定＝不拆
@@ -1015,6 +1051,12 @@ function splitPromptBlocks(parsed, cut) {
 
   // 自檢：接不回去就不要送出去（寧可不拆，也不要送一份被動過的內容）
   if (stable + moving !== parsed.prompt) return null;
+
+  // 份量閘（26-08-27，CX-260827-01）：塊短於模型最小可快取長度就**整個不拆**。
+  // 貼一個低於門檻的標記不是「少省一點」，是**兩頭落空**——標記靜默失效，
+  // 而其餘內容因為我們宣告了不貼、也拿不到斷點。不拆反而讓整包維持單一前綴。
+  // 這道閘擋的是舊版用「則數」把關放行的那一型（實案：5 則＝226 字元）。
+  if (!meetsCacheMinimum(stable, modelId)) return null;
 
   return [
     { type: 'text', text: stable, cache_control: { type: 'ephemeral', ttl: '1h' } },
@@ -1219,16 +1261,29 @@ async function handleChatCompletions(req, res) {
       splitInfo.sticky = held;
       const cut = cutFromMessageIndex(parsedMsgs.historyMsgIdx, held.index);
       splitInfo.cut = cut;
-      splitBlocks = splitPromptBlocks(parsedMsgs, cut);   // 內部會自檢「接回來一字不差」，不合就回 null
+      splitBlocks = splitPromptBlocks(parsedMsgs, cut, modelId);   // 內部會自檢「接回來一字不差」與份量門檻，不合就回 null
       if (splitBlocks) {
         splitInfo.applied = true;
         splitInfo.stableChars = splitBlocks[0].text.length;
         splitInfo.movingChars = splitBlocks[1].text.length;
+        splitInfo.stableTokensEst = estimateTokens(splitBlocks[0].text);
+        splitInfo.minTokens = minCacheTokensFor(modelId);
         console.log(`[${PLUGIN_ID}] 拆塊 #${requestCount + 1}：歷史 ${cut}/${parsedMsgs.historyTurns.length} 則進穩定塊` +
-                    `（${splitInfo.stableChars} 字元貼 1h 標記），其餘 ${splitInfo.movingChars} 字元不貼` +
+                    `（${splitInfo.stableChars} 字元／約 ${splitInfo.stableTokensEst} token 貼 1h 標記，門檻 ${splitInfo.minTokens}），` +
+                    `其餘 ${splitInfo.movingChars} 字元不貼` +
                     `｜斷點 ${held.mode}${held.gain != null ? `（可多納 ${held.gain} 則）` : ''}`);
       } else {
-        splitInfo.reason = `切不出來（cut=${cut}，歷史 ${parsedMsgs.historyTurns ? parsedMsgs.historyTurns.length : 0} 則）`;
+        // 理由要分得出「切不出來」與「切得出來但份量不夠」——這兩件在 cacheRead 上完全同形，
+        // 而後者正是 26-08-27 那個 bug 的臉。不分流的話，修好了也看不出修好沒有。
+        const turns = parsedMsgs.historyTurns || [];
+        const stablePreview = cut > 0 && cut < turns.length ? `<history>\n${turns.slice(0, cut).join('\n')}\n` : '';
+        const est = estimateTokens(stablePreview);
+        const min = minCacheTokensFor(modelId);
+        splitInfo.stableTokensEst = est;
+        splitInfo.minTokens = min;
+        splitInfo.reason = stablePreview && est < min
+          ? `穩定塊只有 ${stablePreview.length} 字元／約 ${est} token，低於 ${modelId || '(未指定模型)'} 的最小可快取長度 ${min}——貼了會被 API 靜默忽略，所以整發不拆`
+          : `切不出來（cut=${cut}，歷史 ${turns.length} 則）`;
         console.log(`[${PLUGIN_ID}] 拆塊 #${requestCount + 1}：這發不拆（${splitInfo.reason}）`);
       }
     } else if (!splitInfo.enabled) {
@@ -1329,6 +1384,7 @@ async function handleChatCompletions(req, res) {
           reqNo: requestCount, mode: 'json', modelId, effort: configEffort,
           shape, imgCount: hasImages ? images.length : 0, costUsd,
           splitApplied: splitInfo.applied,
+          splitReason: splitInfo.reason,
         });
 
         // 空回覆的黑盒子（26-07-27 外部使用者案）：bridge 原本只記請求不記回應，

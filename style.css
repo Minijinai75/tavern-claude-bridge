@@ -132,6 +132,19 @@
   opacity: 0.8;
 }
 
+/* 拆塊開著但沒生效的警告（v1.7.0）。刻意不用 opacity 壓淡——
+   它跟 note 的差別就是「這個要被看到」，弄得跟註腳一樣就等於沒加。 */
+.tcb-cache-warn {
+  display: block;
+  margin-top: 6px;
+  padding: 6px 8px;
+  border-left: 3px solid #d9822b;
+  background: rgba(217, 130, 43, 0.12);
+  font-size: 0.88em;
+  line-height: 1.5;
+  white-space: normal;
+}
+
 .tcb-cache-note {
   display: block;
   font-size: 0.82em;
