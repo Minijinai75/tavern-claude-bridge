@@ -2,7 +2,7 @@ const PLUGIN_ID = 'tavern-claude-bridge';
 const API_BASE = `/api/plugins/${PLUGIN_ID}`;
 const UI_PREFIX = 'tcb';
 const SETTINGS_KEY = 'tavern_claude_bridge';
-const LOCAL_VERSION = '1.7.2';
+const LOCAL_VERSION = '1.7.3';
 const GITHUB_RELEASE_API = 'https://api.github.com/repos/Minijinai75/tavern-claude-bridge/releases/latest';
 let updateCache;
 
@@ -262,6 +262,19 @@ function buildPanel() {
       警.className = `${UI_PREFIX}-cache-warn`;
       警.textContent = `⚠️ ${c.splitWarning.text}`;
       cacheEl.appendChild(警);
+
+      // 系統提示漂移單獨再講一次——它跟「拆塊沒生效」是兩件事，而且它是拆塊救不了的那種。
+      // 26-08-27 實案：使用者想貼診斷給我，在終端機翻兩次都找不到那行（會被輸出捲走）。
+      // 診斷的成本不該由使用者付，所以搬到面板上。
+      if (c.lastSystemDrift) {
+        const 漂 = document.createElement('div');
+        漂.className = `${UI_PREFIX}-cache-warn`;
+        漂.textContent = '⚠️ 你的系統提示每則都在變（角色卡＋預設組出來的那一大段）。'
+          + '它排在對話前面，一變整包快取就作廢——**拆塊救不了這種**。'
+          + '常見來源：世界書的關鍵字觸發條目（綠燈）、每則重算的注入、時間戳。'
+          + '修法是把那些東西挪到對話尾端的會動區（世界書條目改成 @D 深度插入）。';
+        cacheEl.appendChild(漂);
+      }
     }
 
     // ── 細節收進摺疊：回報用的證據，不是給人讀的第一句 ──────────────

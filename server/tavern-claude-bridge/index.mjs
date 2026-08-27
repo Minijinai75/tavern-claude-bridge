@@ -143,6 +143,12 @@ function cacheSummary(t = cacheTally) {
     //
     // 三條不叫的情況：沒樣本、使用者自己關掉（那是他的選擇不是故障）、拆塊率健康。
     splitWarning: splitWarningOf(t),
+    // 診斷要能被面板拿到，不能只活在終端機（26-08-27）。使用者玩完一則想貼診斷給我，
+    // 在終端機裡翻兩次都找不到——那行只進 console.log、會被後面的輸出捲走。
+    // 「診斷的成本不該由使用者付」這條課我當天早上才記，晚上自己又犯一次。
+    lastDivergence: t.lastDivergence ?? null,
+    lastDivergenceZone: t.lastDivergenceZone ?? null,   // 'system' | 'chat' | null
+    lastSystemDrift: t.lastSystemDrift ?? null,
   };
 }
 
@@ -163,10 +169,19 @@ function splitWarningOf(t) {
   const 原因 = t.lastSkipReason
     ? `最近一次的原因是：${t.lastSkipReason}`
     : '這次啟動還沒記到不拆的原因（重開過的話再玩幾則就會有）';
+  // 位置也一起講——只看面板的人才不用去終端機翻。
+  const 位置 = typeof t.lastDivergence === 'number'
+    ? `｜量到的變動點在第 ${t.lastDivergence} 則`
+      + (t.lastDivergenceZone === 'system'
+          ? '，它落在**系統提示區**——拆塊救不了這種，要去找是誰在每則重算那一段'
+          : t.lastDivergenceZone === 'chat'
+            ? '，落在對話區——通常是會回頭改寫舊訊息的機制'
+            : '')
+    : '';
   return {
     level: 'warn',
     text: `拆塊開著，但 ${t.requests} 則裡只有 ${applied} 則真的拆到塊——`
-        + `省快取這件事現在幾乎沒有在發生。${原因}`,
+        + `省快取這件事現在幾乎沒有在發生。${原因}${位置}`,
   };
 }
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
@@ -690,6 +705,9 @@ function recordUsage(usage, ctx) {
     if (ctx.splitApplied) cacheTally.splitApplied++;
     // 不拆的理由要留最後一筆——面板的警告靠它把「沒生效」講成「為什麼沒生效」。
     else if (ctx.splitReason) cacheTally.lastSkipReason = ctx.splitReason;
+    if (ctx.splitDivergence !== undefined) cacheTally.lastDivergence = ctx.splitDivergence;
+    if (ctx.splitZone !== undefined) cacheTally.lastDivergenceZone = ctx.splitZone;
+    if (ctx.systemDrift !== undefined) cacheTally.lastSystemDrift = ctx.systemDrift;
     cacheTally.input += inTok;
     cacheTally.cacheRead += cacheRead;
     cacheTally.cacheWrite += cacheWrite;
@@ -1348,6 +1366,9 @@ async function handleChatCompletions(req, res) {
             + `常見來源：會把狀態寫回舊訊息的變數系統、每則重算的深度注入、系統提示裡的時間戳`
             + 首則;
         splitInfo.divergence = div ?? null;
+        // 落在哪一區也存起來——面板要顯示，不能只活在終端機那行 log 裡
+        splitInfo.zone = (typeof div === 'number' && Number.isFinite(parsedMsgs.headerEnd))
+          ? (div < parsedMsgs.headerEnd ? 'system' : 'chat') : null;
         splitInfo.reason = stablePreview && est < min
           ? `穩定塊只有 ${stablePreview.length} 字元／約 ${est} token，低於 ${modelId || '(未指定模型)'} 的最小可快取長度 ${min}——貼了會被 API 靜默忽略，所以整發不拆`
           : `切不出來（cut=${cut}，歷史 ${turns.length} 則）${變動位置}`;
@@ -1452,6 +1473,9 @@ async function handleChatCompletions(req, res) {
           shape, imgCount: hasImages ? images.length : 0, costUsd,
           splitApplied: splitInfo.applied,
           splitReason: splitInfo.reason,
+          splitDivergence: splitInfo.divergence ?? null,
+          splitZone: splitInfo.zone ?? null,
+          systemDrift: systemDrift.changed,
         });
 
         // 空回覆的黑盒子（26-07-27 外部使用者案）：bridge 原本只記請求不記回應，
@@ -1598,7 +1622,10 @@ async function handleChatCompletions(req, res) {
         reqNo: requestCount, mode: 'stream', modelId, effort: configEffort,
         shape, imgCount: hasImages ? images.length : 0, costUsd,
         splitApplied: splitInfo.applied,
-        splitReason: splitInfo.reason,   // 26-08-27：這條（串流）原本漏了，面板因此對使用者說「還沒記到原因」
+        splitReason: splitInfo.reason,
+          splitDivergence: splitInfo.divergence ?? null,
+          splitZone: splitInfo.zone ?? null,
+          systemDrift: systemDrift.changed,   // 26-08-27：這條（串流）原本漏了，面板因此對使用者說「還沒記到原因」
         aborted: ticket.aborted, suffix: ticket.aborted ? ' (讓位/斷線)' : '',
       });
 
