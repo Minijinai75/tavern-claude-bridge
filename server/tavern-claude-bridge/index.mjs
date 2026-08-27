@@ -884,9 +884,38 @@ function rescueHeaderEnd(messages) {
 }
 
 function parseMessages(messages) {
-  const strict = parseWithHeaderEnd(messages, strictHeaderEnd(messages));
+  const strictEnd = strictHeaderEnd(messages);
+  const strict = parseWithHeaderEnd(messages, strictEnd);
   if (strict.systemPrompt || !messages.some(m => m && m.role === 'system')) return strict;
-  // 判準一失敗且確實有 system → 啟用救援
+
+  // 判準一失敗且確實有 system → 本來會啟用救援（找第一個 assistant 當邊界）。
+  // **但救援只在「header 區確實存在、只是開頭不是 system」時才成立。**
+  //
+  // 26-08-28 實案：使用者的對話開頭就是玩家發言，strictEnd 因此是 0——
+  // 代表「這份訊息根本沒有 header 區」，不是「header 判錯了」。舊碼分不出這兩者，
+  // 一律去救，於是 rescue 一路找到第一個 assistant，把開頭 22 則對話全吃進系統提示區。
+  // 診斷因此每則都在那裡報變動點，而使用者差點照著去改世界書——那完全救不了。
+  //
+  // 抓到它的是 v1.7.6 新加的「內容開頭片段」：只看 role 與長度時它像個設定條目，
+  // 印出開頭「我看了一眼被夾回來的食物…」一看就知道是 RP 對白。
+  // **診斷夠具體，才分得出「使用者的東西」與「我的錯」。**
+  // 兩種形狀在訊息結構上長得一樣，但語義相反，判準是「第一個 assistant 之前有沒有 system」：
+  //
+  //   形狀 A（26-07-27 回報）：usr([PERSONA]), sys([BASELINE]), sys(...), usr(---), sys(...), bot(開場白)
+  //     → 預設把設定條目標成 user，**中間夾著 system**。那些 user 是設定，該救。
+  //
+  //   形狀 B（26-08-28 回報）：usr×21（玩家發言）, bot(回覆), sys(注入), ...
+  //     → 第一個 assistant 之前**一則 system 都沒有**。那些 user 是真對話，不該救。
+  //
+  // 為什麼這條分得開：預設區塊是 system/user 交錯的（不同條目被標成不同角色），
+  // 而真實對話的開頭不會夾 system——system 注入都排在對話開始之後。
+  if (strictEnd === 0) {
+    const firstBot = messages.findIndex(m => m && m.role === 'assistant');
+    const 前面有system = firstBot > 0
+      && messages.slice(0, firstBot).some(m => m && m.role === 'system');
+    if (!前面有system) return strict;   // 開頭是純對話＝真的沒有 header，不要硬救
+  }
+
   return parseWithHeaderEnd(messages, rescueHeaderEnd(messages));
 }
 
