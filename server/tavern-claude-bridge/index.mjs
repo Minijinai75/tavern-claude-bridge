@@ -1041,6 +1041,43 @@ export function cutFromMessageIndex(historyMsgIdx, breakpointMsgIdx) {
 // ttl 一律帶 '1h'：手動標記預設 5m，而 SDK 會在最後一塊自己補 1h，
 // API 規定 1h 不得排在 5m 之後 → 整組 400（26-08-02 實測，request-018 為證）。
 // 這條是結構必然不是經驗法則：SDK 補的位置永遠在我們後面。
+/**
+ * 把「變動點那一則是什麼」講出來（26-08-27，CX-260827-01）。
+ *
+ * 改版紀錄：第一版只在 divergence===0 時開口。當天傍晚使用者回報
+ * `變動點在第 9 則（歷史 71 則）`——**落在中間，第一版一個字都講不出來**，
+ * 而那正是最需要診斷的形狀：對話 71 則穩得很，前面系統提示區有一則每次都在變，
+ * 快取從那裡斷掉、後面全部作廢。使用者拿到「第 9 則」還是不知道該去看什麼。
+ *
+ * **落在系統提示區還是對話區要分開講**，因為這決定了「拆塊救不救得了」：
+ * 拆塊只切對話那一段，變動點在系統提示區時它完全無能為力——這句話不講白，
+ * 使用者會以為調拆塊設定有用，然後白花一輪額度。
+ *
+ * 只讀 role 與長度，不碰內容——RP 內容不進 log（同族：tracePrefix 的隱私規則）。
+ */
+export function describeDivergentTurn(messages, divergence, headerEnd) {
+  if (typeof divergence !== 'number' || !Number.isFinite(divergence)) return '';
+  if (!Array.isArray(messages)) return '';
+  const m = messages[divergence];
+  if (!m) return '';   // 超出範圍：沒有那一則可講，不要瞎編
+
+  const len = typeof m.content === 'string' ? m.content.length
+    : Array.isArray(m.content) ? m.content.reduce((n, p) => n + ((p && p.text && p.text.length) || 0), 0)
+    : 0;
+  const role = m.role || '(未知)';
+  const 界 = Number.isFinite(headerEnd) ? headerEnd : 0;
+  const 在系統區 = divergence < 界;
+
+  const 位置說明 = 在系統區
+    ? `它落在**系統提示區**（前 ${界} 則：角色卡、預設各條目、世界書常駐那些）——`
+      + `**拆塊救不了這種**，因為拆塊只切對話那一段，而這一則排在對話前面，`
+      + `它一變、後面整包作廢。要修得去關掉是誰在每則重算它`
+    : `它落在**對話區**（第 ${divergence - 界} 則對話）——`
+      + `通常是會回頭改寫舊訊息的機制（狀態欄寫回、變數系統更新舊樓）`;
+
+  return `｜**第 ${divergence} 則是 role=${role}、長度 ${len} 字元**——${位置說明}`;
+}
+
 function splitPromptBlocks(parsed, cut, modelId) {
   const turns = parsed && parsed.historyTurns;
   if (!Array.isArray(turns) || turns.length === 0) return null;
@@ -1298,11 +1335,18 @@ async function handleChatCompletions(req, res) {
         // 「切不出來（cut=0，歷史 32 則）」，訊息本身沒告訴她該去看哪裡）。
         // divergence 是「從頭數第幾則開始對不上」，換算成「距離最新第幾則」比較好懂。
         const div = evaluated && evaluated.decision ? evaluated.decision.divergence : null;
+        // divergence===0 是最壞的一種：**整包從第一則就對不上**，快取一格都留不住。
+        // 這時候「變動點在第 0 則」講了等於沒講——使用者需要知道**第 0 則是什麼東西**，
+        // 才找得到是誰在改它。這個診斷要預設就有，不能還要人去開環境變數
+        // （26-08-27 實案：兩位使用者都卡在 divergence=0，而 TCB_TURN_TRACE 預設關著，
+        //  要他們開開關重跑等於再燒一次額度——診斷的成本不該由使用者付）。
+        const 首則 = describeDivergentTurn(messages, div, parsedMsgs.headerEnd);
         const 變動位置 = div === null || div === undefined
           ? ''
           : `｜量到的變動點在第 ${div} 則（距離最新第 ${Math.max(0, messages.length - div)} 則）`
             + `——**每則都有東西在改這個位置之前的內容**，快取因此整包作廢。`
-            + `常見來源：會把狀態寫回舊訊息的變數系統、每則重算的深度注入、系統提示裡的時間戳`;
+            + `常見來源：會把狀態寫回舊訊息的變數系統、每則重算的深度注入、系統提示裡的時間戳`
+            + 首則;
         splitInfo.divergence = div ?? null;
         splitInfo.reason = stablePreview && est < min
           ? `穩定塊只有 ${stablePreview.length} 字元／約 ${est} token，低於 ${modelId || '(未指定模型)'} 的最小可快取長度 ${min}——貼了會被 API 靜默忽略，所以整發不拆`
