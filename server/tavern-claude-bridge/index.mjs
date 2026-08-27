@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 // 拆塊斷點掃描器（26-08-02，CX-260802-03）：只做「斷點該落在哪一則」的計算，
 // 不碰渲染也不貼標記——分工線在那支的檔頭註解。目前只被量測模式用到。
-import { fingerprintTurns, decideBreakpoint, stickyBreakpoint, meetsCacheMinimum, estimateTokens, minCacheTokensFor } from './cache-breakpoint.mjs';
+import { fingerprintTurns, decideBreakpoint, stickyBreakpoint, meetsCacheMinimum, estimateTokens, minCacheTokensFor, trackSystemPrompt } from './cache-breakpoint.mjs';
 
 // ESM 沒有 __dirname，自己算（快取讀數落檔要用——見 appendCacheLog）
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1247,6 +1247,18 @@ async function handleChatCompletions(req, res) {
     // 三道閘任何一道不過就退回原本的單一字串——**寧可不省，也不要送出被動過的內容**。
     let splitBlocks = null;
     const splitInfo = { enabled: splitEnabled(), applied: false, cut: null, stableChars: null, movingChars: null, reason: null, sticky: null };
+
+    // 系統提示有沒有在變（26-08-27，CX-260827-01 第四刀）。
+    // 拆塊只管對話那一段，但 system 排在更前面——它動一個字，後面整包作廢，
+    // 而症狀跟「拆塊沒生效」在讀數上完全同形（cacheRead 都是 0）。這一格是為了分得出來。
+    // 只存雜湊不存原文（使用者的角色卡與預設不落盤）。
+    const systemDrift = trackSystemPrompt(systemPrompt, splitState);
+    if (systemDrift.changed) {
+      cacheTally.systemDriftCount = (cacheTally.systemDriftCount || 0) + 1;
+      console.warn(`[${PLUGIN_ID}] 第 ${requestCount + 1} 發：**系統提示跟上一發不一樣**`
+        + `（雜湊 ${systemDrift.hash}）——它排在對話前面，一變整包快取就作廢，拆塊救不了。`
+        + `常見來源：角色卡或預設裡有每則重算的內容（時間戳最常見）、剛改過設定、換了角色卡`);
+    }
     // 第一發（沒有上一發可比）**不拆**。26-08-03 實測教訓：
     //   那時只能靠結構掃描猜位置，而結構掃描看不到改寫型機制（蛇），猜出來的 113 踩進會動區，
     //   害第二發被迫 forced 修正——等於白費一發。而第一發本來就在建立、貼了也讀不到，不虧。
@@ -1281,9 +1293,20 @@ async function handleChatCompletions(req, res) {
         const min = minCacheTokensFor(modelId);
         splitInfo.stableTokensEst = est;
         splitInfo.minTokens = min;
+        // cut=0 的時候「切不出來」講了等於沒講——使用者需要知道的是**哪裡在變**，
+        // 因為那個東西在他的設定裡、只有他關得掉（26-08-27 實案：一位使用者拿到
+        // 「切不出來（cut=0，歷史 32 則）」，訊息本身沒告訴她該去看哪裡）。
+        // divergence 是「從頭數第幾則開始對不上」，換算成「距離最新第幾則」比較好懂。
+        const div = evaluated && evaluated.decision ? evaluated.decision.divergence : null;
+        const 變動位置 = div === null || div === undefined
+          ? ''
+          : `｜量到的變動點在第 ${div} 則（距離最新第 ${Math.max(0, messages.length - div)} 則）`
+            + `——**每則都有東西在改這個位置之前的內容**，快取因此整包作廢。`
+            + `常見來源：會把狀態寫回舊訊息的變數系統、每則重算的深度注入、系統提示裡的時間戳`;
+        splitInfo.divergence = div ?? null;
         splitInfo.reason = stablePreview && est < min
           ? `穩定塊只有 ${stablePreview.length} 字元／約 ${est} token，低於 ${modelId || '(未指定模型)'} 的最小可快取長度 ${min}——貼了會被 API 靜默忽略，所以整發不拆`
-          : `切不出來（cut=${cut}，歷史 ${turns.length} 則）`;
+          : `切不出來（cut=${cut}，歷史 ${turns.length} 則）${變動位置}`;
         console.log(`[${PLUGIN_ID}] 拆塊 #${requestCount + 1}：這發不拆（${splitInfo.reason}）`);
       }
     } else if (!splitInfo.enabled) {
@@ -1531,6 +1554,7 @@ async function handleChatCompletions(req, res) {
         reqNo: requestCount, mode: 'stream', modelId, effort: configEffort,
         shape, imgCount: hasImages ? images.length : 0, costUsd,
         splitApplied: splitInfo.applied,
+        splitReason: splitInfo.reason,   // 26-08-27：這條（串流）原本漏了，面板因此對使用者說「還沒記到原因」
         aborted: ticket.aborted, suffix: ticket.aborted ? ' (讓位/斷線)' : '',
       });
 
