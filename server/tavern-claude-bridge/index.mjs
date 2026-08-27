@@ -875,12 +875,39 @@ function strictHeaderEnd(messages) {
 }
 
 function rescueHeaderEnd(messages) {
-  const firstAssistant = messages.findIndex(m => m && m.role === 'assistant');
-  if (firstAssistant >= 0) return firstAssistant;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i] && messages[i].role === 'user') return i;   // 保住當前訊息
+  if (!Array.isArray(messages)) return 0;
+  const firstBot = messages.findIndex(m => m && m.role === 'assistant');
+  if (firstBot < 0) {
+    // 沒有 assistant（新聊天：只有設定，玩家剛送出第一句還沒收到回覆）。
+    // **保住當前訊息**——回 messages.length 會把玩家正在送出的那句也吃進 header。
+    // 這條路徑目前幾乎不可達（上游閘門會先攔下 strictEnd===0 的情形），
+    // 但改寫時我差點把它弄丟，而「不可達」不等於「不可能」：上游判準一改它就活了。
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i] && messages[i].role === 'user') return i;
+    }
+    return messages.length;
   }
-  return messages.length;
+
+  // 從第一個 assistant **往回走**，遇到 system 就停（26-08-28 第四刀）。
+  //
+  // 舊版直接回 firstBot，假設「角色說過話才代表對話開始」。那對純設定區塊成立，
+  // 但漏掉這種形狀（26-08-28 外部回報，跑 v1.7.7 仍中）：
+  //   設定區塊（user/system 交錯）… 真實對話 … 第一個 assistant
+  // 第一個 assistant 之前確實有 system（設定區塊裡的），v1.7.7 的閘門因此放行 rescue，
+  // 而 rescue 一路吃到 assistant——**把夾在中間的對話一起吃進系統提示區**。
+  // 使用者看到診斷指著她自己打的話說「它在系統提示區」，差點又去改世界書。
+  //
+  // 判準：設定區塊是 user/system 交錯的（每塊設定後面還有別的設定），
+  // 而**對話一旦開始就不會再夾 system**——注入都排在對話之後。
+  // 所以從 firstBot 往回收，收到最後一則 system 為止；那之後的都是對話。
+  let end = firstBot;
+  for (let i = firstBot - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m) continue;
+    if (m.role === 'system') break;   // 碰到設定就停，這裡就是 header 的盡頭
+    end = i;                          // 這則不是 system 且後面沒 system → 它是對話
+  }
+  return end;
 }
 
 function parseMessages(messages) {
