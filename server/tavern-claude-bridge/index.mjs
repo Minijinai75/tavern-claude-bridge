@@ -159,12 +159,19 @@ function cacheSummary(t = cacheTally) {
  * 斷點剛好在頭幾則），偶爾不拆不是病；**長期過半不拆才是**。
  */
 function splitWarningOf(t) {
-  const 樣本夠 = t.requests >= 3;
   // 帳本沒帶這欄就問即時狀態（production 走這條）；測試傳假帳本時可以覆寫。
   const 開著 = t.splitEnabled !== undefined ? t.splitEnabled !== false : splitEnabled();
-  if (!樣本夠 || !開著) return null;
+  if (!開著 || !t.requests) return null;
   const applied = t.splitApplied || 0;
-  if (applied * 2 >= t.requests) return null;     // 過半有拆到＝健康
+  // **樣本不夠不是閉嘴的理由**（26-08-28 v1.8.1，使用者實案催出來的）：
+  // 舊碼要滿三則才肯講話，於是燒掉三成額度來問「為什麼」的人，
+  // 得到的回應是面板沉默——最需要診斷的人最看不到診斷。
+  // 分開來看：「省多少」要幾則才算得準（那個門檻留在 cacheSummary 那側），
+  // 「為什麼沒拆」第一則就知道了，沒有理由要人再花兩則的錢買。
+  // 差別只在措辭：樣本不夠時不下「長期有問題」的判斷，只陳述這幾則的事實。
+  const 樣本夠 = t.requests >= 3;
+  if (樣本夠 && applied * 2 >= t.requests) return null;     // 過半有拆到＝健康
+  if (!樣本夠 && applied > 0) return null;                   // 樣本少但有拆到＝先不吵
 
   const 原因 = t.lastSkipReason
     ? `最近一次的原因是：${t.lastSkipReason}`
@@ -178,10 +185,14 @@ function splitWarningOf(t) {
             ? '，落在對話區——通常是會回頭改寫舊訊息的機制'
             : '')
     : '';
+  // 樣本不夠時語氣要收：陳述事實、不下長期判斷，但原因與位置照給。
+  const 開頭 = 樣本夠
+    ? `拆塊開著，但 ${t.requests} 則裡只有 ${applied} 則真的拆到塊——省快取這件事現在幾乎沒有在發生。`
+    : `拆塊開著，但這 ${t.requests} 則都沒拆到塊。才玩 ${t.requests} 則還不能說是不是長期問題，`
+      + `不過原因現在就查得到，不用等你再花幾則的錢：`;
   return {
-    level: 'warn',
-    text: `拆塊開著，但 ${t.requests} 則裡只有 ${applied} 則真的拆到塊——`
-        + `省快取這件事現在幾乎沒有在發生。${原因}${位置}`,
+    level: 樣本夠 ? 'warn' : 'info',
+    text: `${開頭}${原因}${位置}`,
   };
 }
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
