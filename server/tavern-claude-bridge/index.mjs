@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 // 拆塊斷點掃描器（26-08-02，CX-260802-03）：只做「斷點該落在哪一則」的計算，
 // 不碰渲染也不貼標記——分工線在那支的檔頭註解。目前只被量測模式用到。
-import { fingerprintTurns, decideBreakpoint, stickyBreakpoint, meetsCacheMinimum, estimateTokens, minCacheTokensFor, trackSystemPrompt, analyzeShift, cacheRoi } from './cache-breakpoint.mjs';
+import { fingerprintTurns, decideBreakpoint, stickyBreakpoint, meetsCacheMinimum, estimateTokens, minCacheTokensFor, trackSystemPrompt, analyzeShift, cacheRoi, shortDiff, textOfTurn } from './cache-breakpoint.mjs';
 
 // ESM 沒有 __dirname，自己算（快取讀數落檔要用——見 appendCacheLog）
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -998,6 +998,12 @@ let prevTurnKey = null;
 // 兩處用同一把尺，不會出現「計數說 3 則、基準說 4 則」這種各說各話。
 let pendingTurnFps = null;
 let pendingTurnKey = null;
+
+// 被改寫那一則的原文快照（26-08-29 v1.8.4）。只留**一則**——診斷要講得出「變成什麼」
+// 就夠了，留整份對話是拿記憶體換一個用不到的精度。
+// 跟指紋基準同一條紀律：**失敗的請求不提交**，否則下一發拿沒送出去的東西比。
+let prevRewriteSnap = null;      // { index, text }
+let pendingRewriteSnap = null;
 const splitState = { sticky: null };   // 上次實際用過的斷點（黏住用；重啟歸零＝重新建一次，安全）
 const TURN_LOG_MAX_BYTES = 2 * 1024 * 1024;
 // **一發只准算一次**：量測模式與拆塊模式都要用這個結果，各自算一次的話，
@@ -1022,7 +1028,23 @@ export function evaluateBreakpoint(messages, headerEnd, convKey) {
   // 這一發是哪一種變化——滑動／改寫／追加。**沒有這一格，診斷會把視窗滑動
   // 說成「有東西在改寫」，叫人去抓一隻不存在的鬼**（26-08-29 實案，見 analyzeShift）。
   const shift = analyzeShift(pendingTurnFps, prevFps);
-  return { decision, prevFps, fps: pendingTurnFps, shift };
+
+  // 被改寫的那一則「變成什麼」——**只有 rewrite 才算**。
+  // 滑動的時候同一個 index 坐的根本是不同訊息，拿它們比對出來的「差異」是垃圾，
+  // 而且會長得很像證據——那正是今晚那隻鬼的形狀（26-08-29）。
+  let rewriteDiff = null;
+  const ri = shift?.kind === 'rewrite' ? shift.index : null;
+  if (typeof ri === 'number' && Array.isArray(messages) && messages[ri]) {
+    const curText = textOfTurn(messages[ri]);
+    if (prevRewriteSnap && prevRewriteSnap.index === ri) {
+      rewriteDiff = shortDiff(prevRewriteSnap.text, curText);
+    }
+    pendingRewriteSnap = { index: ri, text: curText };
+  } else {
+    pendingRewriteSnap = null;
+  }
+
+  return { decision, prevFps, fps: pendingTurnFps, shift, rewriteDiff };
 }
 
 /**
@@ -1033,6 +1055,8 @@ export function commitTurnBaseline() {
   if (!pendingTurnFps) return false;
   prevTurnFps = pendingTurnFps;
   prevTurnKey = pendingTurnKey;
+  prevRewriteSnap = pendingRewriteSnap;
+  pendingRewriteSnap = null;
   pendingTurnFps = null;
   return true;
 }
@@ -1551,7 +1575,13 @@ async function handleChatCompletions(req, res) {
               + `這一項橋修不了，是酒館設定層的事`
             : `｜量到的變動點在第 ${div} 則（距離最新第 ${Math.max(0, messages.length - div)} 則）`
               + `——這個位置的內容跟上一發不同，快取從這裡開始整包作廢。`
-              + `常見來源：會把狀態寫回舊訊息的變數系統、每則重算的深度注入、系統提示裡的時間戳`
+              // 講得出「變成什麼」就別只講「哪裡變了」（26-08-29）：那個變動點只差兩個字元，
+              // 三個人推了一小時才猜到是時間巨集的分鐘進位——而這個差異橋本來就看得到。
+              + (evaluated?.rewriteDiff
+                  ? `｜**跟上一發差在這裡**：「${evaluated.rewriteDiff.before}」→「${evaluated.rewriteDiff.after}」`
+                    + `（前後文：⋯${evaluated.rewriteDiff.context}⋯）`
+                  : '')
+              + `｜常見來源：會把狀態寫回舊訊息的變數系統、每則重算的深度注入、系統提示裡的時間戳`
               + 首則);
         splitInfo.divergence = div ?? null;
         // 落在哪一區也存起來——面板要顯示，不能只活在終端機那行 log 裡
