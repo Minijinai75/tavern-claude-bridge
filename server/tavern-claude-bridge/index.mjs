@@ -955,12 +955,28 @@ function parseMessages(messages) {
 //
 // 開關：TCB_TURN_TRACE=1。預設關，關著的時候這段一步都不走。
 let prevTurnFps = null;   // 上一發的逐則指紋（記憶體即可，橋重啟歸零＝第一發走 fallback，安全）
+// **基準要綁對話**（26-08-28 第五種變形，外部回報催出來的）：
+// prevTurnFps 原本是純全域，換一個聊天／換角色卡照樣拿來比——第一個對不上的位置
+// 就成了「假的變動點」，而且**它會落在對話開頭**（共用角色卡時 header 一樣、對話不同）。
+// 使用者看到的正是「對話區第 0 則每則都在變」，然後照著去翻自己那則寫定的舊對話——
+// 那則什麼事都沒有。**我今天已經犯過一次同型（儀器說謊、害三個人追一整夜）。**
+//
+// 綁法：用 systemPrompt 的雜湊當對話識別。橋看不到酒館的 chat id，但同一個對話的
+// header（角色卡＋預設＋常駐世界書）是穩定的；換卡換聊天它就變。
+// 不完美（同一張卡開兩個聊天會撞），但比純全域好一個量級，而且不用跨進酒館的檔案結構。
+let prevTurnKey = null;
 const splitState = { sticky: null };   // 上次實際用過的斷點（黏住用；重啟歸零＝重新建一次，安全）
 const TURN_LOG_MAX_BYTES = 2 * 1024 * 1024;
 // **一發只准算一次**：量測模式與拆塊模式都要用這個結果，各自算一次的話，
 // 第二次會拿「這一發自己」當基準（prevTurnFps 已被第一次更新掉），分歧點變成整串長度、
 // 斷點直接跑到最尾巴——而那看起來像「這發超級穩定」，是會騙人的那種錯。
-function evaluateBreakpoint(messages, headerEnd) {
+export function evaluateBreakpoint(messages, headerEnd, convKey) {
+  // 對話換了就丟掉基準——拿別的對話當基準，算出來的分歧點是假的（見 prevTurnKey 註解）。
+  // convKey 拿不到時（呼叫端沒給）維持舊行為，不要在這裡自己造一個半吊子的識別。
+  if (convKey !== undefined && convKey !== prevTurnKey) {
+    prevTurnFps = null;
+    prevTurnKey = convKey;
+  }
   const decision = decideBreakpoint(messages, prevTurnFps, {
     headerEnd,
     safetyTurns: Math.max(0, parseInt(process.env.TCB_SAFETY_TURNS, 10) || 1),
@@ -969,6 +985,11 @@ function evaluateBreakpoint(messages, headerEnd) {
   const prevFps = prevTurnFps;
   prevTurnFps = fingerprintTurns(messages);
   return { decision, prevFps, fps: prevTurnFps };
+}
+
+/** 對話識別：header 的雜湊。同一張卡＋同一組設定＝同一個對話串。 */
+export function conversationKey(systemPrompt) {
+  return createHash('sha1').update(String(systemPrompt || '')).digest('hex').slice(0, 12);
 }
 
 function traceTurns(messages, headerEnd, reqNo, evaluated, splitInfo) {
@@ -1372,7 +1393,7 @@ async function handleChatCompletions(req, res) {
     // 斷點：量測模式與拆塊模式共用同一次計算（兩邊各算一次會讓第二次拿自己當基準，
     // 見 evaluateBreakpoint 的註解）。兩個開關都關著就完全不算，不付這個成本。
     const bpNeeded = process.env.TCB_TURN_TRACE === '1' || splitEnabled();
-    const evaluated = bpNeeded ? evaluateBreakpoint(messages, headerEnd) : null;
+    const evaluated = bpNeeded ? evaluateBreakpoint(messages, headerEnd, conversationKey(systemPrompt)) : null;
     // 前綴指紋：只在 TCB_PREFIX_TRACE=1 時動作，兩條路徑（串流／非串流）都在這之後分岔，
     // 所以放這裡一次涵蓋——8/01 只改非串流那份、真實情境一次都沒觸發，不再犯。
     tracePrefix(systemPrompt, prompt, requestCount + 1);
