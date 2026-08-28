@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 // 拆塊斷點掃描器（26-08-02，CX-260802-03）：只做「斷點該落在哪一則」的計算，
 // 不碰渲染也不貼標記——分工線在那支的檔頭註解。目前只被量測模式用到。
-import { fingerprintTurns, decideBreakpoint, stickyBreakpoint, meetsCacheMinimum, estimateTokens, minCacheTokensFor, trackSystemPrompt } from './cache-breakpoint.mjs';
+import { fingerprintTurns, decideBreakpoint, stickyBreakpoint, meetsCacheMinimum, estimateTokens, minCacheTokensFor, trackSystemPrompt, analyzeShift } from './cache-breakpoint.mjs';
 
 // ESM 沒有 __dirname，自己算（快取讀數落檔要用——見 appendCacheLog）
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1007,7 +1007,10 @@ export function evaluateBreakpoint(messages, headerEnd, convKey) {
   // 算好先放著，**等請求真的成功再由 commitTurnBaseline() 提交**（見 pendingTurnFps 註解）
   pendingTurnFps = fingerprintTurns(messages);
   pendingTurnKey = convKey !== undefined ? convKey : prevTurnKey;
-  return { decision, prevFps, fps: pendingTurnFps };
+  // 這一發是哪一種變化——滑動／改寫／追加。**沒有這一格，診斷會把視窗滑動
+  // 說成「有東西在改寫」，叫人去抓一隻不存在的鬼**（26-08-29 實案，見 analyzeShift）。
+  const shift = analyzeShift(pendingTurnFps, prevFps);
+  return { decision, prevFps, fps: pendingTurnFps, shift };
 }
 
 /**
@@ -1526,10 +1529,18 @@ async function handleChatCompletions(req, res) {
         const 首則 = describeDivergentTurn(messages, div, parsedMsgs.headerEnd);
         const 變動位置 = div === null || div === undefined
           ? ''
-          : `｜量到的變動點在第 ${div} 則（距離最新第 ${Math.max(0, messages.length - div)} 則）`
-            + `——每則都有東西在改這個位置之前的內容，快取因此整包作廢。`
-            + `常見來源：會把狀態寫回舊訊息的變數系統、每則重算的深度注入、系統提示裡的時間戳`
-            + 首則;
+          : (evaluated?.shift?.kind === 'slide'
+            // 視窗滑動：**沒有兇手**。舊版在這裡寫「有東西在改這個位置之前的內容」，
+            // 把三個工程師送去找一隻不存在的鬼（26-08-29）——變動點根本不是同一則訊息。
+            ? `｜**你的對話塞不下上下文了**：這一發比上一發多丟掉 ${evaluated.shift.dropped} 則最舊的訊息。`
+              + `不是有東西在改寫你的訊息，是送出去的起點每則都在往後移，快取的前綴因此永遠對不上。`
+              + `要解得把起點固定住——把舊對話永久隱藏、或壓成一段不再變動的摘要；`
+              + `也可以把「回覆保留長度」調小，那會讓每次少丟一點舊訊息（但只要對話還是超過預算，滑動就還在）。`
+              + `這一項橋修不了，是酒館設定層的事`
+            : `｜量到的變動點在第 ${div} 則（距離最新第 ${Math.max(0, messages.length - div)} 則）`
+              + `——這個位置的內容跟上一發不同，快取從這裡開始整包作廢。`
+              + `常見來源：會把狀態寫回舊訊息的變數系統、每則重算的深度注入、系統提示裡的時間戳`
+              + 首則);
         splitInfo.divergence = div ?? null;
         // 落在哪一區也存起來——面板要顯示，不能只活在終端機那行 log 裡
         splitInfo.zone = (typeof div === 'number' && Number.isFinite(parsedMsgs.headerEnd))
