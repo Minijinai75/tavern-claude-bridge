@@ -773,6 +773,10 @@ function recordUsage(usage, ctx) {
     cacheRead,
     cacheWrite,
     hitPct,
+    shiftKind: ctx.shiftKind ?? null,
+    shiftDropped: ctx.shiftDropped ?? null,
+    rewriteDiff: ctx.rewriteDiff ?? null,
+    rewriteFull: ctx.rewriteFull ?? null,
     // 訂閱額度使用率——SDK 順便給的，比 token 數對訂閱制更有意義
     ...(flat.fiveHourPct != null ? { quota5hPct: flat.fiveHourPct } : {}),
     ...(flat.sevenDayPct != null ? { quota7dPct: flat.sevenDayPct } : {}),
@@ -1033,18 +1037,27 @@ export function evaluateBreakpoint(messages, headerEnd, convKey) {
   // 滑動的時候同一個 index 坐的根本是不同訊息，拿它們比對出來的「差異」是垃圾，
   // 而且會長得很像證據——那正是今晚那隻鬼的形狀（26-08-29）。
   let rewriteDiff = null;
+  let rewriteFull = null;
   const ri = shift?.kind === 'rewrite' ? shift.index : null;
   if (typeof ri === 'number' && Array.isArray(messages) && messages[ri]) {
     const curText = textOfTurn(messages[ri]);
     if (prevRewriteSnap && prevRewriteSnap.index === ri) {
       rewriteDiff = shortDiff(prevRewriteSnap.text, curText);
     }
+    // 完整前後兩版只在診斷模式落檔（TCB_TURN_TRACE=1）。
+    // 為什麼要分層：差異片段（24 字元上限）多數情況就夠認出是時間戳還是狀態欄，
+    // 那個預設就給；但真的查不出來的疑難雜症需要看完整原文，而那是使用者的對話內容——
+    // **預設不落檔，要看的人自己開**。這條線畫在「隱私」與「診斷的成本不該由使用者付」之間：
+    // 前者贏在預設值，後者贏在「有需要時打得開，而且不用改碼」。
+    if (process.env.TCB_TURN_TRACE === '1' && prevRewriteSnap && prevRewriteSnap.index === ri) {
+      rewriteFull = { index: ri, before: prevRewriteSnap.text, after: curText };
+    }
     pendingRewriteSnap = { index: ri, text: curText };
   } else {
     pendingRewriteSnap = null;
   }
 
-  return { decision, prevFps, fps: pendingTurnFps, shift, rewriteDiff };
+  return { decision, prevFps, fps: pendingTurnFps, shift, rewriteDiff, rewriteFull };
 }
 
 /**
@@ -1693,6 +1706,12 @@ async function handleChatCompletions(req, res) {
           splitReason: splitInfo.reason,
           splitDivergence: splitInfo.divergence ?? null,
           splitZone: splitInfo.zone ?? null,
+          // 改寫診斷落檔（26-08-29）：差異片段預設就落，完整前後兩版要開 TCB_TURN_TRACE=1。
+          // 橋是唯一看得到實際送出內容的位置——外部工具攔不到 payload 的時候，這裡是唯一的證據源。
+          shiftKind: evaluated?.shift?.kind ?? null,
+          shiftDropped: evaluated?.shift?.dropped ?? null,
+          rewriteDiff: evaluated?.rewriteDiff ?? null,
+          rewriteFull: evaluated?.rewriteFull ?? null,
           systemDrift: systemDrift.changed,
         });
 
@@ -1843,6 +1862,12 @@ async function handleChatCompletions(req, res) {
         splitReason: splitInfo.reason,
           splitDivergence: splitInfo.divergence ?? null,
           splitZone: splitInfo.zone ?? null,
+          // 改寫診斷落檔（26-08-29）：差異片段預設就落，完整前後兩版要開 TCB_TURN_TRACE=1。
+          // 橋是唯一看得到實際送出內容的位置——外部工具攔不到 payload 的時候，這裡是唯一的證據源。
+          shiftKind: evaluated?.shift?.kind ?? null,
+          shiftDropped: evaluated?.shift?.dropped ?? null,
+          rewriteDiff: evaluated?.rewriteDiff ?? null,
+          rewriteFull: evaluated?.rewriteFull ?? null,
           systemDrift: systemDrift.changed,   // 26-08-27：這條（串流）原本漏了，面板因此對使用者說「還沒記到原因」
         aborted: ticket.aborted, suffix: ticket.aborted ? ' (讓位/斷線)' : '',
       });
