@@ -2,7 +2,7 @@ const PLUGIN_ID = 'tavern-claude-bridge';
 const API_BASE = `/api/plugins/${PLUGIN_ID}`;
 const UI_PREFIX = 'tcb';
 const SETTINGS_KEY = 'tavern_claude_bridge';
-const LOCAL_VERSION = '1.8.2';
+const LOCAL_VERSION = '1.8.3';
 const GITHUB_RELEASE_API = 'https://api.github.com/repos/Minijinai75/tavern-claude-bridge/releases/latest';
 let updateCache;
 
@@ -283,6 +283,27 @@ function buildPanel() {
     摘要.textContent = '詳細數據（回報給我們的時候用這個）';
     細節.appendChild(摘要);
 
+    // 快取到底幫你省了還是多花了——**報數字不報賺賠，等於沒說**（26-08-29 第九種形狀）。
+    // 判定由後端 cacheRoi 算（連續兩發間隔＋這發有沒有讀到），這裡只負責講人話。
+    const 快取划算嗎 = (roi) => {
+      if (!roi || roi.verdict === 'unknown') return '';
+      const 錢 = (n) => `US$${Number(n).toFixed(4)}`;
+      if (roi.verdict === 'wasted') {
+        const 間隔 = typeof roi.lastGapHours === 'number' && roi.lastGapHours >= 1
+          ? `距上一則隔了 ${roi.lastGapHours.toFixed(1)} 小時，上次的快取早就過期了。`
+          : '';
+        return `⚠️ 這段期間的快取沒有回本：${間隔}`
+          + `新建快取付的是一般輸入的兩倍價，而這 ${roi.writes} 發建立的快取一次都沒讀到，`
+          + `等於多付了約 ${錢(roi.extraUsd)}。`
+          + `如果你通常隔幾小時才玩一則，快取在你身上是淨成本——這不是設定錯，是玩法跟快取的有效期對不上。`;
+      }
+      if (roi.verdict === 'paying-off') {
+        return `✅ 快取有回本：這段期間讀到快取省下約 ${錢(roi.savedUsd)}，`
+          + `扣掉新建多付的 ${錢(roi.extraUsd)} 仍然是划算的。`;
+      }
+      return `快取目前打平附近：省下 ${錢(roi.savedUsd)}、新建多付 ${錢(roi.extraUsd)}。`;
+    };
+
     const 倍 = c.savedRatio;
     const 內文 = document.createElement('div');
     內文.className = `${UI_PREFIX}-cache-note`;
@@ -290,6 +311,9 @@ function buildPanel() {
       `拆塊：${b.split ? '開著' : '關著'}${b.splitLocked ? '（被啟動參數鎖住）' : ''}`
         + `｜${c.requests} 則裡有 ${c.splitApplied} 則拆到塊`,
       `輸入 token：讀到快取 ${千分位(c.cacheRead)}／新建快取 ${千分位(c.cacheWrite)}／未快取 ${千分位(c.input)}`,
+      // 那筆「新建」的錢有沒有收回來（26-08-29）。只報數字的話，「新建快取 50,000」
+      // 看起來像做了好事——實際上新建是一般輸入的兩倍價，隔幾小時才玩一則的人一次都收不回。
+      快取划算嗎(c.cacheRoi),
       倍 ? `累計換算：沒有快取的話要付 ${倍} 倍（含開頭的建立費，所以剛開始會小於 1）` : '',
       '註：花費與 token 數是實測值；「幾倍」是換算——讀快取算 1/10 價、新建快取算 2 倍價、'
         + '未快取算 1 倍，只算輸入側（輸出不受快取影響）。',

@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 // 拆塊斷點掃描器（26-08-02，CX-260802-03）：只做「斷點該落在哪一則」的計算，
 // 不碰渲染也不貼標記——分工線在那支的檔頭註解。目前只被量測模式用到。
-import { fingerprintTurns, decideBreakpoint, stickyBreakpoint, meetsCacheMinimum, estimateTokens, minCacheTokensFor, trackSystemPrompt, analyzeShift } from './cache-breakpoint.mjs';
+import { fingerprintTurns, decideBreakpoint, stickyBreakpoint, meetsCacheMinimum, estimateTokens, minCacheTokensFor, trackSystemPrompt, analyzeShift, cacheRoi } from './cache-breakpoint.mjs';
 
 // ESM 沒有 __dirname，自己算（快取讀數落檔要用——見 appendCacheLog）
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -113,6 +113,13 @@ const cacheTally = {
   lastSkipReason: null,   // 最近一次「這發不拆」的理由（面板警告靠它把「沒生效」講成「為什麼」）
 };
 
+// 最近幾發的輕量紀錄（26-08-29 v1.8.3）——**只為了回答一個問題：那筆新建的錢收回來了嗎。**
+// 累計器答不了它，因為判定要看「每發之間隔多久」與「這發有沒有讀到」，那是逐發的形狀。
+// 落檔的 cache-log 裡也有，但面板是即時的、不該為了畫一行字去讀檔。
+// 存三個數字乘以十幾筆，成本可以忽略；橋重啟歸零，跟面板其他統計同一個口徑。
+const CACHE_HISTORY_MAX = 12;
+const cacheHistory = [];
+
 // 「沒有快取的話要付幾倍」——純比例換算，不需要任何價目表。
 //   實際加權 ＝ 未快取×1 ＋ 讀快取×0.1 ＋ 建快取×2
 //   反事實　 ＝ 三者全部按一般輸入×1（沒有快取機制的話，這些 token 一樣要送）
@@ -149,6 +156,9 @@ function cacheSummary(t = cacheTally) {
     lastDivergence: t.lastDivergence ?? null,
     lastDivergenceZone: t.lastDivergenceZone ?? null,   // 'system' | 'chat' | null
     lastSystemDrift: t.lastSystemDrift ?? null,
+    // 那筆新建的錢有沒有收回來（26-08-29）。面板只報「新建快取 50,000」的話，
+    // 看起來像做了好事——實際上新建是一般輸入的兩倍價，隔幾小時才玩一則的人一次都收不回。
+    cacheRoi: t === cacheTally ? cacheRoi(cacheHistory) : null,
   };
 }
 
@@ -713,6 +723,8 @@ function recordUsage(usage, ctx) {
   // 而那種稀釋看起來像「快取效果變差」，是會害人查錯方向的假訊號。
   if (usage) {
     cacheTally.requests++;
+    cacheHistory.push({ atMs: Date.now(), cacheWrite, cacheRead });
+    if (cacheHistory.length > CACHE_HISTORY_MAX) cacheHistory.shift();
     // 這一發真的送到了 → 它才有資格當下一發的比較基準（見 pendingTurnFps 註解）
     commitTurnBaseline();
     if (ctx.splitApplied) cacheTally.splitApplied++;
