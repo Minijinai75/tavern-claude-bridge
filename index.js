@@ -2,7 +2,7 @@ const PLUGIN_ID = 'tavern-claude-bridge';
 const API_BASE = `/api/plugins/${PLUGIN_ID}`;
 const UI_PREFIX = 'tcb';
 const SETTINGS_KEY = 'tavern_claude_bridge';
-const LOCAL_VERSION = '1.7.9';
+const LOCAL_VERSION = '1.8.0';
 const GITHUB_RELEASE_API = 'https://api.github.com/repos/Minijinai75/tavern-claude-bridge/releases/latest';
 let updateCache;
 

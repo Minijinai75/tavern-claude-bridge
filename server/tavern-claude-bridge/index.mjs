@@ -702,6 +702,8 @@ function recordUsage(usage, ctx) {
   // 而那種稀釋看起來像「快取效果變差」，是會害人查錯方向的假訊號。
   if (usage) {
     cacheTally.requests++;
+    // 這一發真的送到了 → 它才有資格當下一發的比較基準（見 pendingTurnFps 註解）
+    commitTurnBaseline();
     if (ctx.splitApplied) cacheTally.splitApplied++;
     // 不拆的理由要留最後一筆——面板的警告靠它把「沒生效」講成「為什麼沒生效」。
     else if (ctx.splitReason) cacheTally.lastSkipReason = ctx.splitReason;
@@ -965,6 +967,14 @@ let prevTurnFps = null;   // 上一發的逐則指紋（記憶體即可，橋重
 // header（角色卡＋預設＋常駐世界書）是穩定的；換卡換聊天它就變。
 // 不完美（同一張卡開兩個聊天會撞），但比純全域好一個量級，而且不用跨進酒館的檔案結構。
 let prevTurnKey = null;
+// **基準只在請求成功後才提交**（26-08-28 第六種變形，使用者「額度不足→重刷」催出來的）：
+// evaluateBreakpoint 跑在送出前，舊碼當場就把 prevTurnFps 換掉——所以請求失敗（額度不足、
+// 連線斷、使用者按了停）也照樣更新基準，下一發等於跟一個**從未送出去的東西**比對。
+// API 那側根本沒收到那一發，真正該當基準的是上一發成功的。
+// 判準跟 cacheTally.requests++ 用同一個（`if (usage)`）——量得到用量才算真的送出去了，
+// 兩處用同一把尺，不會出現「計數說 3 則、基準說 4 則」這種各說各話。
+let pendingTurnFps = null;
+let pendingTurnKey = null;
 const splitState = { sticky: null };   // 上次實際用過的斷點（黏住用；重啟歸零＝重新建一次，安全）
 const TURN_LOG_MAX_BYTES = 2 * 1024 * 1024;
 // **一發只准算一次**：量測模式與拆塊模式都要用這個結果，各自算一次的話，
@@ -983,8 +993,30 @@ export function evaluateBreakpoint(messages, headerEnd, convKey) {
     fallbackDepth: Math.max(1, parseInt(process.env.TCB_FALLBACK_DEPTH, 10) || 8),
   });
   const prevFps = prevTurnFps;
-  prevTurnFps = fingerprintTurns(messages);
-  return { decision, prevFps, fps: prevTurnFps };
+  // 算好先放著，**等請求真的成功再由 commitTurnBaseline() 提交**（見 pendingTurnFps 註解）
+  pendingTurnFps = fingerprintTurns(messages);
+  pendingTurnKey = convKey !== undefined ? convKey : prevTurnKey;
+  return { decision, prevFps, fps: pendingTurnFps };
+}
+
+/**
+ * 提交這一發的指紋當下一發的基準。**只有請求真的成功才准呼叫**。
+ * 失敗的請求不提交——它從來沒到過 API，拿它當基準會讓下一發報出假的變動點。
+ */
+export function commitTurnBaseline() {
+  if (!pendingTurnFps) return false;
+  prevTurnFps = pendingTurnFps;
+  prevTurnKey = pendingTurnKey;
+  pendingTurnFps = null;
+  return true;
+}
+
+/** 測試用：把模組層級的基準清乾淨，讓每組測試從同一個起點開始。 */
+export function __resetTurnBaseline() {
+  prevTurnFps = null;
+  prevTurnKey = null;
+  pendingTurnFps = null;
+  pendingTurnKey = null;
 }
 
 /** 對話識別：header 的雜湊。同一張卡＋同一組設定＝同一個對話串。 */
