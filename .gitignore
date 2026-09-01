@@ -1,0 +1,7 @@
+node_modules/
+
+# 執行時產生的資料，絕不進版控（含實際對話的診斷片段）
+cache-log.jsonl
+empty-replies.jsonl
+usage-*.jsonl
+*.log

@@ -6,7 +6,7 @@
   "js": "index.js",
   "css": "style.css",
   "author": "Mini AI Team",
-  "version": "1.8.5",
+  "version": "1.8.6",
   "description": "Connect SillyTavern to Claude via official Agent SDK and your own subscription.",
   "hooks": {
     "activate": "init"

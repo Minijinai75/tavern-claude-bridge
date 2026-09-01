@@ -777,6 +777,12 @@ function recordUsage(usage, ctx) {
     shiftDropped: ctx.shiftDropped ?? null,
     rewriteDiff: ctx.rewriteDiff ?? null,
     rewriteFull: ctx.rewriteFull ?? null,
+    // 26-09-01：系統提示雜湊落檔。原本只把 changed 這個布林傳進 ctx、而且沒進 entry——
+    // 等於記了最沒用的那一格。使用者反映「玩到下一則就看不到上一則的面板」，
+    // 而分辨「一直在變」與「來回切換」靠的正是雜湊序列，那只活在 console 裡。
+    sysDrift: ctx.systemDrift ?? null,
+    sysHash: ctx.sysHash ?? null,
+    sysRecurring: ctx.sysRecurring ?? null,
     // 訂閱額度使用率——SDK 順便給的，比 token 數對訂閱制更有意義
     ...(flat.fiveHourPct != null ? { quota5hPct: flat.fiveHourPct } : {}),
     ...(flat.sevenDayPct != null ? { quota7dPct: flat.sevenDayPct } : {}),
@@ -1527,9 +1533,20 @@ async function handleChatCompletions(req, res) {
     const systemDrift = trackSystemPrompt(systemPrompt, splitState);
     if (systemDrift.changed) {
       cacheTally.systemDriftCount = (cacheTally.systemDriftCount || 0) + 1;
+      // 26-09-01：這裡原本寫「常見來源：…（時間戳最常見）」——那是指認，不是陳述。
+      // 一位使用者照著去翻角色卡與預設裡的 {{time}}／{{date}}，翻不到，因為她的形狀
+      // 根本不是那型（雜湊會落回看過的值）。v1.8.2 立過「診斷的本分是報實況不是抓兇手」，
+      // 這一格漏掉了。現在改成：分得出來才講，分不出來就說還分不出來。
+      const shape = systemDrift.recurring
+        ? '**這串雜湊之前出現過**——系統提示是在幾個狀態之間來回切換，'
+          + '比較像「有東西時有時無」（例如世界書條目按關鍵字激活／不激活），'
+          + '而不是「有東西每則重算」。這型拔不掉，修法是把它移出系統提示區、搬到末尾。'
+        : '還分不出是哪一型：記下這串雜湊，多幾發就知道——'
+          + '每次都是新值＝有東西每則重算（那型可以拔掉）；'
+          + '落回看過的值＝有東西時有時無（那型要搬走，拔不掉）。';
       console.warn(`[${PLUGIN_ID}] 第 ${requestCount + 1} 發：**系統提示跟上一發不一樣**`
         + `（雜湊 ${systemDrift.hash}）——它排在對話前面，一變整包快取就作廢，拆塊救不了。`
-        + `常見來源：角色卡或預設裡有每則重算的內容（時間戳最常見）、剛改過設定、換了角色卡`);
+        + shape);
     }
     // 第一發（沒有上一發可比）**不拆**。26-08-03 實測教訓：
     //   那時只能靠結構掃描猜位置，而結構掃描看不到改寫型機制（蛇），猜出來的 113 踩進會動區，
@@ -1713,6 +1730,8 @@ async function handleChatCompletions(req, res) {
           rewriteDiff: evaluated?.rewriteDiff ?? null,
           rewriteFull: evaluated?.rewriteFull ?? null,
           systemDrift: systemDrift.changed,
+          sysHash: systemDrift.hash,
+          sysRecurring: systemDrift.recurring,
         });
 
         // 空回覆的黑盒子（26-07-27 外部使用者案）：bridge 原本只記請求不記回應，
@@ -1869,6 +1888,8 @@ async function handleChatCompletions(req, res) {
           rewriteDiff: evaluated?.rewriteDiff ?? null,
           rewriteFull: evaluated?.rewriteFull ?? null,
           systemDrift: systemDrift.changed,   // 26-08-27：這條（串流）原本漏了，面板因此對使用者說「還沒記到原因」
+          sysHash: systemDrift.hash,
+          sysRecurring: systemDrift.recurring,
         aborted: ticket.aborted, suffix: ticket.aborted ? ' (讓位/斷線)' : '',
       });
 
