@@ -812,6 +812,9 @@ function recordUsage(usage, ctx) {
     sysDrift: ctx.systemDrift ?? null,
     sysHash: ctx.sysHash ?? null,
     sysRecurring: ctx.sysRecurring ?? null,
+    // 26-09-02（CX-260902-03 ⑤）：對話識別。同一個聊天每發相同、換聊天才變——「基準被丟」與「基準留著」在讀數上分不出來，這格分得出來。
+    // 只是對話開頭兩則的指紋（各 12 碼），不含內容。
+    convKey: ctx.convKey ?? null,
     // ③ 系統提示走第一則的那幾發才落：sysFirst＋兩個快取點座標（三塊那發 s1 是 null）。關閉時**沒有這幾個鍵**。
     ...(ctx.splitSysFirst ? { sysFirst: true, s1: ctx.splitS1 ?? null, s2: ctx.splitS2 ?? null } : {}),
     // 26-09-02 組成表彙總（CX-260902-01）：系統區／對話／注入各多少則多少字元、跟上一發幾則變幾則移位。
@@ -1045,7 +1048,7 @@ function parseMessages(messages, { prevFps = null, prevKey } = {}) {
   let out = parseWithHeaderEnd(messages, end);
   // 基準要綁對話（跟 evaluateBreakpoint 同一條紀律）：算出來的 header 若對不上上一發的 key，那份基準是別的對話的，
   // 不拿它判 moved——用無基準重算一次。key 得先有 systemPrompt 才算得出來，所以只能算完再驗、驗不過再重來一次。
-  if (prevFps && prevKey !== undefined && conversationKey(out.systemPrompt) !== prevKey) {
+  if (prevFps && prevKey !== undefined && !sameConversation(prevKey, conversationKey(out.systemPrompt, messages, end))) {
     const end2 = rescueHeaderEnd(messages, null);
     if (end2 !== end) out = parseWithHeaderEnd(messages, end2);
   }
@@ -1108,7 +1111,8 @@ export function evaluateBreakpoint(messages, headerEnd, convKey) {
   // convKey 拿不到時（呼叫端沒給）維持舊行為，不要在這裡自己造一個半吊子的識別。
   // **但不在這裡改 prevTurnKey／prevTurnFps／splitState**（26-09-02 審核 A5／A10）：這一發若失敗，
   // 舊對話的基準與 sticky 要還在——使用者換到新聊天第一發撞額度、切回舊聊天，舊的一切不該被清掉。
-  const keyChanged = convKey !== undefined && convKey !== prevTurnKey;
+  // 26-09-02（CX-260902-03）：比 key 用 sameConversation——「開場白單則長成雙則」不算換對話（見 conversationKey 註解）。
+  const keyChanged = convKey !== undefined && !sameConversation(prevTurnKey, convKey);
   const baseFps = keyChanged ? null : prevTurnFps;
   const baseSnap = keyChanged ? null : prevRewriteSnap;
   // 26-09-02（審核 C5）：換對話時 sticky 斷點與雜湊歷史也要歸零——放暫存，成功才提交。
@@ -1121,15 +1125,29 @@ export function evaluateBreakpoint(messages, headerEnd, convKey) {
     systemHash: splitState.systemHash,
     systemHashSeen: keyChanged ? [] : [...(splitState.systemHashSeen || [])],
   };
-  const decision = decideBreakpoint(messages, baseFps, {
+  // 算好先放著，**等請求真的成功再由 commitTurnBaseline() 提交**（見 pendingTurnFps 註解）
+  pendingTurnFps = fingerprintTurns(messages);
+  pendingTurnKey = convKey !== undefined ? convKey : prevTurnKey;
+  // 26-09-02（CX-260902-03）：**header 內的變動不計入斷點的分歧點**。
+  // 斷點切的是對話流（header 那段已進 systemPrompt，不在拆塊範圍）；系統提示變了整包前綴作廢是另一層的事，
+  // 由 trackSystemPrompt 報漂移、composeTurns 指出哪則變。以前基準綁 systemPrompt 雜湊、系統提示一變就丟基準，
+  // 這條路根本走不到；現在基準留著，header 那則變動若照算進 findDivergence，分歧點落在 header 裡 →
+  // decideBreakpoint 把斷點頂到 headerEnd → 穩定區 0 → skip——使用者看到的是「系統提示在變」＋「不拆」，
+  // sticky 建不起來，等她修好漂移還要再繞一發。所以餵給 decideBreakpoint 的基準，header 段換成這一發自己的指紋；
+  // 回傳的 prevFps／analyzeShift 仍用完整基準（診斷要看得到 header 那則）。
+  let baseForBreakpoint = baseFps;
+  let headerChanged = 0;
+  if (baseFps && headerEnd > 0) {
+    baseForBreakpoint = baseFps.map((f, i) => (i < headerEnd && i < pendingTurnFps.length ? pendingTurnFps[i] : f));
+    for (let i = 0; i < headerEnd && i < baseFps.length && i < pendingTurnFps.length; i++) if (baseFps[i] !== pendingTurnFps[i]) headerChanged++;
+  }
+  const decision = decideBreakpoint(messages, baseForBreakpoint, {
     headerEnd,
     safetyTurns: Math.max(0, parseInt(process.env.TCB_SAFETY_TURNS, 10) || 1),
     fallbackDepth: Math.max(1, parseInt(process.env.TCB_FALLBACK_DEPTH, 10) || 8),
   });
+  if (headerChanged > 0) decision.why += `｜系統區有 ${headerChanged} 則跟上一發不同，不計入斷點（那層歸系統提示漂移管，見 sysDrift／comp.sys.changed）`;
   const prevFps = baseFps;
-  // 算好先放著，**等請求真的成功再由 commitTurnBaseline() 提交**（見 pendingTurnFps 註解）
-  pendingTurnFps = fingerprintTurns(messages);
-  pendingTurnKey = convKey !== undefined ? convKey : prevTurnKey;
   // 這一發是哪一種變化——滑動／改寫／追加。**沒有這一格，診斷會把視窗滑動
   // 說成「有東西在改寫」，叫人去抓一隻不存在的鬼**（26-08-29 實案，見 analyzeShift）。
   const shift = analyzeShift(pendingTurnFps, prevFps);
@@ -1158,7 +1176,8 @@ export function evaluateBreakpoint(messages, headerEnd, convKey) {
     pendingRewriteSnap = null;
   }
 
-  return { decision, prevFps, fps: pendingTurnFps, shift, rewriteDiff, rewriteFull };
+  // convKey 一起回：cache-log／turn-log 每筆落一格，事後看得出「有沒有換鑰匙」（CX-260902-03 ⑤）
+  return { decision, prevFps, fps: pendingTurnFps, shift, rewriteDiff, rewriteFull, convKey: pendingTurnKey };
 }
 
 /**
@@ -1247,9 +1266,48 @@ export function __resetTurnBaseline() {
   splitState.systemHashSeen = [];
 }
 
-/** 對話識別：header 的雜湊。同一張卡＋同一組設定＝同一個對話串。 */
-export function conversationKey(systemPrompt) {
-  return createHash('sha1').update(String(systemPrompt || '')).digest('hex').slice(0, 12);
+/**
+ * 對話識別（26-09-02 CX-260902-03 改綁對話開頭；舊版是 header 的雜湊）。
+ *
+ * 為什麼不再用 systemPrompt 的雜湊：綾的實測（橋 1.8.7）——她的系統提示每發變（時間戳型），
+ * key 於是每發變，evaluateBreakpoint 每發都判「換對話」丟基準：四發同一個聊天，每發都印
+ * 「沒有上一發可比」、斷點 37→31→32→28 每發靠結構猜、comp.sys.changed 全空——
+ * **最需要診斷「系統區哪一則在變」的人，正是被這把 key 弄瞎的人。**
+ *
+ * 新綁法：對話流開頭兩則（messages[headerEnd]、messages[headerEnd+1]）的內容指紋——
+ * 同一個聊天這兩則不會變（開場白＋玩家第一句），換聊天／換卡／換開場白才變。
+ * 指紋用 cache-breakpoint 那套（fingerprintTurns），不另發明一套雜湊。
+ * 系統提示變了 → key 不變 → 基準留著 → 漂移由 trackSystemPrompt 報、變在哪則由 composeTurns 指。
+ *
+ * 三種形狀（sameConversation 靠這個分）：
+ *   `fp0.fp1`（25 碼）  對話流 ≥ 2 則——正常情況
+ *   `fp0`（12 碼）      對話流只有 1 則——新聊天只有開場白、或沒開場白的卡玩家剛送第一句
+ *   `s:hash`（14 碼）   沒有對話流（headerEnd＝總長）——退回舊法（systemPrompt 雜湊）；舊簽名只給 systemPrompt 也走這裡
+ *
+ * 「開場白單則」那個邊界（工單規格 1）：不用「舊法→新法視同一對話」——那條會把「只有開場白的聊天 A →
+ * 有對話的聊天 B」也放行（A 的 key 是系統提示雜湊，對任何 B 都相容），正是 8/28 修掉的污染再開一個門。
+ * 改成：單則 key 就是開場白自己的指紋；下一發滿 2 則時 key 以它為前綴（`fp0.fp1`）——
+ * sameConversation 認「前綴相同」為同一個聊天長出了第二則。反過來（雙則→單則）當換對話，保守。
+ * 同卡另開新聊天（開場白同、只有 1 則）從有對話的聊天切過去也會被判換對話（雙則→單則）——對。
+ * 但從「只有開場白的聊天 A」切到「同卡、有對話的聊天 B」會被放行：A 的內容確實是 B 的前綴，
+ * 算出來是純追加、不是假變動點，可接受。
+ */
+export function conversationKey(systemPrompt, messages, headerEnd) {
+  if (Array.isArray(messages) && typeof headerEnd === 'number' && headerEnd >= 0 && headerEnd < messages.length) {
+    const head = fingerprintTurns(messages.slice(headerEnd, headerEnd + 2));
+    return head.join('.');
+  }
+  return 's:' + createHash('sha1').update(String(systemPrompt || '')).digest('hex').slice(0, 12);
+}
+
+/**
+ * 兩把 key 是不是同一個聊天。相等＝同一個；「單則長成雙則」（開場白單則的 key 是雙則 key 的前綴）也算同一個。
+ * 其餘一律當換了——寧可多丟一發基準，不拿別的對話當基準（8/28 第五種變形的紀律）。
+ */
+export function sameConversation(prevKey, curKey) {
+  if (prevKey === curKey) return true;
+  if (typeof prevKey !== 'string' || typeof curKey !== 'string') return false;
+  return prevKey.length === 12 && !prevKey.includes('.') && curKey.startsWith(prevKey + '.');
 }
 
 function traceTurns(messages, headerEnd, reqNo, evaluated, splitInfo, compIn) {
@@ -1268,6 +1326,7 @@ function traceTurns(messages, headerEnd, reqNo, evaluated, splitInfo, compIn) {
       n: reqNo,
       total: messages.length,
       headerEnd,
+      convKey: (evaluated && evaluated.convKey) ?? null,   // 26-09-02 對話識別（CX-260902-03 ⑤），跟 cache-log 同一把
       // 拆塊實況：開關開了沒／有沒有真的拆／切在哪。沒有這格的話，
       // 「標記沒貼上去」與「貼了但沒作用」在 cacheRead 上完全同形，查不出來。
       // reason 在不拆時夾著 describeDivergentTurn() 的「、開頭：「…30 字…」」——那是內容。
@@ -1696,6 +1755,7 @@ export function usageCtx(base, { mode, aborted = false, suffix = aborted ? ' (�
     sysHash: systemDrift.hash,
     sysRecurring: systemDrift.recurring,
     comp: comp.summary,   // 26-09-02 組成表彙總（CX-260902-01）
+    convKey: evaluated?.convKey ?? null,   // 26-09-02 對話識別（CX-260902-03 ⑤）：事後看有沒有換鑰匙
   };
 }
 
@@ -1831,7 +1891,7 @@ async function handleChatCompletions(req, res) {
     // 26-09-02（CX-260902-01）：組成表**預設開**，每發都要有「上一發的指紋」可比，所以斷點評估
     // 不再看開關——它本來就是純計算，基準只在請求成功後由 commitTurnBaseline 提交。
     // 拆塊關著時 evaluated 照算但不用來切，只餵組成表與診斷。
-    const evaluated = evaluateBreakpoint(messages, headerEnd, conversationKey(systemPrompt));
+    const evaluated = evaluateBreakpoint(messages, headerEnd, conversationKey(systemPrompt, messages, headerEnd));
     // 組成表：每一則是 系統區／對話／注入、多長、跟上一發 同／移位／新。
     // 彙總進 cache-log 與面板，逐則進 turn-log（traceTurns）。指紋沿用 evaluated 算好的，不重算。
     // 為什麼要它：一位使用者的「擴充功能 7,074 token」在酒館面板只有總數、內建子項全是 0——
