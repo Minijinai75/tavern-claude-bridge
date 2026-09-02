@@ -450,24 +450,25 @@ export function decideBreakpoint(messages, prevFps, opts = {}) {
  * @returns {{index:number, mode:'skip'|'new'|'forced'|'jump'|'held', gain?:number}}
  */
 export function stickyBreakpoint(decision, state, jumpGain = 40) {
+  // 26-09-02（審核 A5／A10）：**純函式**——不再寫 state.sticky，改回 nextSticky（建議的新值），
+  // 由呼叫端決定何時寫。橋在請求成功後才提交；失敗那發（額度不足、斷線）算出來的 jump／forced 全部丟棄，
+  // 不然下一發會黏在一個從未送到 API 的位置上。state 只讀 sticky 這一格。
+  const cur = state && state.sticky != null ? state.sticky : null;
   const fresh = decision.index;
-  if (!(fresh > 0)) return { index: 0, mode: 'skip' };
+  if (!(fresh > 0)) return { index: 0, mode: 'skip', nextSticky: cur };
 
-  if (state.sticky == null) { state.sticky = fresh; return { index: fresh, mode: 'new' }; }
+  if (cur == null) return { index: fresh, mode: 'new', nextSticky: fresh };
 
   // 會動區是否追上舊斷點：divergence＝第一個變動的位置，穩定塊是 0..sticky-1，
   // 所以 sticky == div 時穩定塊一字未變、不用跳；只有 sticky > div（變動點落進穩定塊）才 forced。
   // （26-09-02 審核 C12b：舊寫法 >= 在 sticky == div 時多重建一次）
   const div = decision.divergence;
-  if (div !== null && state.sticky > div) {
-    state.sticky = fresh;
-    return { index: fresh, mode: 'forced' };
-  }
+  if (div !== null && cur > div) return { index: fresh, mode: 'forced', nextSticky: fresh };
 
-  const gain = fresh - state.sticky;
-  if (gain >= jumpGain) { state.sticky = fresh; return { index: fresh, mode: 'jump', gain }; }
+  const gain = fresh - cur;
+  if (gain >= jumpGain) return { index: fresh, mode: 'jump', gain, nextSticky: fresh };
 
-  return { index: state.sticky, mode: 'held', gain };
+  return { index: cur, mode: 'held', gain, nextSticky: cur };
 }
 
 /**
@@ -541,16 +542,70 @@ export function minCacheTokensFor(modelId) {
 }
 
 /**
+ * 中文（CJK）一字算幾個 token——**按模型查表**（26-09-02 第二波 b ⑤，審核 C 第 8 條）。
+ *
+ * 為什麼要查表：係數是 tokenizer 相依的。Opus 4.7 起換了 tokenizer（Opus 4.7／4.8／5、Sonnet 5、
+ * Fable 5／5.1、Mythos 都是這顆），同一段字約多 1×～1.35× 的 token；寫死一個數字對某些模型就是錯的。
+ *
+ * 出處（claude-api skill，bundled 2.1.258；26-09-02 查）：
+ *   - SKILL.md「Claude Fable 5.1」段：same tokenizer as Opus 4.8 (introduced with Opus 4.7)…
+ *     the Opus 4.7 tokenizer uses ~1×-1.35× as many tokens（相對 Opus 4.6／Sonnet／Haiku）
+ *   - shared/model-migration.md「New tokenizer (~30% more tokens)」：Sonnet 5 uses the same new tokenizer
+ *     as Opus 4.7/4.8. The same input text produces approximately 30% more tokens than on Sonnet 4.6
+ *   - shared/model-migration.md「Tokenizer - unchanged from Opus 4.8」：roughly 1×-1.35×
+ *     (varies by content and workload shape)
+ *   **沒有任何一份給「CJK 每字幾 token」的數字**，只有整體倍率、而且註明隨內容形狀變。
+ *
+ * 所以這張表現在**全部是預設值 1.0**、結構先立好：估算必須偏低估（低估 ⟹ 估到夠就是真的夠），
+ * 新 tokenizer 產的 token 只會更多，1.0 對它們仍是下界、不會把不夠的說成夠。要往上調（例如新家族 1.3）
+ * 得先用 count_tokens 對中文 RP 樣本實測，拿到數字再填——猜一個往上的數字會讓門檻閘變寬鬆，那是錯的方向。
+ * 值＝「一個 CJK 字算幾 token」的原始係數；安全折 TOKEN_ESTIMATE_SAFETY 另外打，所以有效係數＝1.0 × 0.9 ＝ 0.9（現行）。
+ * 比對用前綴（startsWith），`[1m]` 尾綴先剝；**長的排前面**（fable-5-1 在 fable-5 之前）。
+ */
+export const CJK_TOKENS_PER_CHAR = {
+  default: 1.0,
+  // 舊 tokenizer（Opus 4.6 及更早、Sonnet 4.x、Haiku）——現行係數就是照這批量出來的
+  'claude-opus-4-6': 1.0,
+  'claude-opus-4-5': 1.0,
+  'claude-sonnet-4-6': 1.0,
+  'claude-sonnet-4-5': 1.0,
+  'claude-haiku-4-5': 1.0,
+  'claude-haiku-3-5': 1.0,
+  // 新 tokenizer（Opus 4.7 起）——實際 token 更多（1×～1.35×），1.0 仍是下界；沒查到 CJK 每字數字，先不往上填
+  'claude-opus-4-7': 1.0,
+  'claude-opus-4-8': 1.0,
+  'claude-opus-5': 1.0,
+  'claude-sonnet-5': 1.0,
+  'claude-fable-5-1': 1.0,
+  'claude-fable-5': 1.0,
+  'claude-mythos-5-1': 1.0,
+  'claude-mythos-5': 1.0,
+};
+
+/** 整體安全折——估完再打九折，讓下界更硬。 */
+export const TOKEN_ESTIMATE_SAFETY = 0.9;
+
+/** 查某顆模型的 CJK 係數；查不到、沒給、型別不對都走 default。 */
+export function cjkTokensPerChar(modelId) {
+  if (typeof modelId !== 'string' || !modelId) return CJK_TOKENS_PER_CHAR.default;
+  const id = modelId.trim().toLowerCase().replace(/\[1m\]$/, '');
+  const keys = Object.keys(CJK_TOKENS_PER_CHAR).filter(k => k !== 'default').sort((a, b) => b.length - a.length);
+  const hit = keys.find(k => id.startsWith(k));
+  return hit ? CJK_TOKENS_PER_CHAR[hit] : CJK_TOKENS_PER_CHAR.default;
+}
+
+/**
  * 保守估 token 數——**一律往低估的方向**。
  *
  * 方向很重要：低估 ⟹「估到夠」就是「真的夠」。高估會讓無效標記溜過去，
  * 也就是這次要修的那個 bug 換一種形狀復發。
  *
- * 規則：CJK 一字算 1 token（實際常略高於 1），其他字元算 1/4（實際約 1/4），
+ * 規則：CJK 一字算 cjkTokensPerChar(modelId) 個 token（預設 1；實際常略高於 1），其他字元算 1/4（實際約 1/4），
  * 最後整體再打 0.9 折當安全邊際。橋沒有 tokenizer，也不該為了這件事裝一個——
  * 我們要的不是精確值，是一個「不會把不夠的說成夠」的下界。
+ * modelId 不給＝走預設係數（跟 26-09-02 之前的行為逐位相同）。
  */
-export function estimateTokens(text) {
+export function estimateTokens(text, modelId) {
   if (typeof text !== 'string' || !text) return 0;
   let cjk = 0;
   for (const ch of text) {
@@ -559,12 +614,20 @@ export function estimateTokens(text) {
         (c >= 0x20000 && c <= 0x2fa1f)) cjk++;
   }
   const rest = [...text].length - cjk;
-  return Math.floor((cjk + rest / 4) * 0.9);
+  return Math.floor((cjk * cjkTokensPerChar(modelId) + rest / 4) * TOKEN_ESTIMATE_SAFETY);
 }
 
-/** 這塊文字貼上 cache_control 之後，在這顆模型上會不會真的生效。 */
-export function meetsCacheMinimum(text, modelId) {
-  return estimateTokens(text) >= minCacheTokensFor(modelId);
+/**
+ * 這塊文字貼上 cache_control 之後，在這顆模型上會不會真的生效。
+ *
+ * 26-09-02 第二波 b ④：**門檻算的是「到斷點為止的整個前綴」，不是塊自身**。
+ * spike δ 實測（spike_多斷點_260902/報告.md 第二節 Q2）：784 token 的塊排在 11k 前綴後照樣建了快取——
+ * API 看的是斷點前面累積了多少，塊邊界只決定 lookup 的位置。
+ * prefixText＝排在這塊前面、橋自己看得到的那段（systemPrompt）；SDK 自己加的內建句不算進來，
+ * 所以估出來的仍是下界（保守側）。不給就是 0，行為跟以前一樣。
+ */
+export function meetsCacheMinimum(text, modelId, prefixText = '') {
+  return estimateTokens(prefixText, modelId) + estimateTokens(text, modelId) >= minCacheTokensFor(modelId);
 }
 
 

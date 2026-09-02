@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 // 拆塊斷點掃描器（26-08-02，CX-260802-03）：只做「斷點該落在哪一則」的計算，
 // 不碰渲染也不貼標記——分工線在那支的檔頭註解。目前只被量測模式用到。
-import { fingerprintTurns, decideBreakpoint, stickyBreakpoint, meetsCacheMinimum, estimateTokens, minCacheTokensFor, trackSystemPrompt, analyzeShift, cacheRoi, shortDiff, textOfTurn, composeTurns, composeLine } from './cache-breakpoint.mjs';
+import { fingerprintTurns, decideBreakpoint, stickyBreakpoint, meetsCacheMinimum, estimateTokens, minCacheTokensFor, trackSystemPrompt, analyzeShift, cacheRoi, shortDiff, textOfTurn, composeTurns, composeLine, kindOfTurn } from './cache-breakpoint.mjs';
 
 // ESM 沒有 __dirname，自己算（快取讀數落檔要用——見 appendCacheLog）
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -49,7 +49,7 @@ try {
 // 錯在哪：**那組實驗只驗了「快取建不建得起來」，沒驗「整包能讀回多少」。**
 // 前綴只有一段 system，讀回 8102 就等於全中，看不出對話流那側的差別。
 //
-// 下午的翻案實測（test/spike-resume-cache_260802.mjs，同樣內容三組對照）：
+// 下午的翻案實測（test/spike/spike-resume-cache_260802.mjs，同樣內容三組對照）：
 //   persistSession:false ......... 讀  7,023  寫 4,978  $0.0541   ← 只吃到系統提示
 //   persistSession:true .......... 讀 12,001  寫     0  $0.0066   ← 整包全中，省 88%
 //   persistSession:true + resume . 讀 12,001  寫    46  $0.0068   ← 不需要 resume 就有了
@@ -60,7 +60,7 @@ try {
 // 教訓（值得留給下一個人）：**在錯誤的量測條件下驗過一次，比沒驗過更危險**——
 // 它會拿到一張看起來合格的免罪符，然後被寫進註解叫後人「不必再追」。
 //
-// 實驗腳本：上午 test/spike-cache-threshold_260802.mjs／下午 test/spike-resume-cache_260802.mjs
+// 實驗腳本：上午 test/spike/spike-cache-threshold_260802.mjs／下午 test/spike/spike-resume-cache_260802.mjs
 //
 // 各模型的最小可快取前綴差很多，換模型要一起想這件事：
 //   Opus 5 / Fable 5 = 512｜Opus 4.8 / Sonnet 5 = 1024｜Opus 4.7 = 2048｜Opus 4.6 = 4096
@@ -77,7 +77,7 @@ function systemPromptForSdk(systemPrompt) {
 //   真的在意這件事的人不會用酒館——所以對外也預設開。
 // ・不吃 resume：實測顯示光是 true 就整包命中，不需要橋去記 sessionId（那會引入跨請求狀態）
 // 設 TCB_PERSIST_SESSION=0 可退回舊行為（每則一次性 session，不留檔但吃不到對話流快取）。
-function persistSessionOption() {
+export function persistSessionOption() {
   return process.env.TCB_PERSIST_SESSION !== '0';
 }
 
@@ -159,6 +159,8 @@ function cacheSummary(t = cacheTally) {
     // 26-09-02（審核 C9）：最近一次漂移是「落回看過的值」（true＝有東西時有時無，關鍵字條目那型）
     // 還是「每次都是新值」（false＝時間戳那型）。沒資料回 null，前端不准拿 null 當 false 印。
     lastSystemRecurring: t.lastSystemRecurring ?? null,
+    // 26-09-02（⑫）：最近一發有值的 5h 額度使用率；一發都沒有就 null（前端顯示「還沒有數據」，不印 0%）
+    lastQuota5hPct: t.lastQuota5hPct ?? null,
     // 那筆新建的錢有沒有收回來（26-08-29）。面板只報「新建快取 50,000」的話，
     // 看起來像做了好事——實際上新建是一般輸入的兩倍價，隔幾小時才玩一則的人一次都收不回。
     cacheRoi: t === cacheTally ? cacheRoi(cacheHistory) : null,
@@ -281,11 +283,28 @@ let configSplit = !SPLIT_LOCKED_OFF;
 
 function splitEnabled() { return configSplit; }
 
+// 診斷模式（26-09-02 ⑨ 後端半邊）：turn-log 每則的 head（開頭 30 字）、split.reason 裡變動點那則的片段、
+// rewriteFull（改寫前後完整兩版）——這些**會碰到對話內容**的欄位只在診斷模式落檔。
+// 以前只有環境變數 TCB_TURN_TRACE=1 能開，使用者不會設環境變數，要診斷等於叫他改腳本重開酒館。
+// 現在面板 /config 的 trace 欄可開可關；環境變數仍可強制開（向後相容，舊腳本不必改）。
+let configTrace = false;
+function traceEnabled() { return configTrace || process.env.TCB_TURN_TRACE === '1'; }
+
+// 系統提示走對話第一則（26-09-02 第二波 b ③，spike δ 定案；Mini 拍板「做成開關、寫得簡單易懂」）。
+// **預設關，關的時候一切跟現在一樣。**
+// 為什麼要它：SDK 自己佔 3 個 cache_control（內建句／我們傳的 systemPrompt／messages 尾），手動只剩 1 個；
+// 把系統提示塞進 user 第一塊（不貼標記）→ system 側只剩 SDK 內建句 1 個，messages 就放得下 2 個手動斷點＋SDK 尾 1＝4。
+// 兩個手動斷點＝「舊穩定塊」與「新增段」分開貼：跳斷點時舊塊逐字不動照樣命中、只重寫增量（spike δ Q3 實測）。
+// 代價寫在面板文案裡：角色卡從 system 角色變 user 角色，模型看待它的方式可能微妙地不同——這是使用者自己選的。
+let configSysInFirstTurn = false;
+function sysInFirstTurnEnabled() { return configSysInFirstTurn; }
+
 // /config 的讀寫只有這一份實作，兩條路徑（5199 直連與 ST 同源 router）都呼叫它。
 // 26-08-03 抽出來的理由很實際：原本兩邊各寫一份幾乎相同的邏輯，加第三個欄位就要改兩處，
 // 而「改一半」的症狀是安靜的——面板走 router 那條會動，curl 走 5199 那條不動，兩邊都不報錯。
 function currentConfig() {
-  return { effort: configEffort, thinking: configThinking, split: configSplit, splitLocked: SPLIT_LOCKED_OFF };
+  // trace 回的是**實際生效值**（面板開 或 環境變數強制開），跟 splitLocked 同一個念頭：面板要看到真相，不是看到自己送過什麼
+  return { effort: configEffort, thinking: configThinking, split: configSplit, splitLocked: SPLIT_LOCKED_OFF, trace: traceEnabled(), sysInFirstTurn: configSysInFirstTurn };
 }
 
 // 只認得懂的欄位、只吃型別對的值；其餘一律忽略並維持原值（髒資料不該把設定踩回預設）。
@@ -295,6 +314,8 @@ function applyConfig(cfg) {
   if (typeof cfg.thinking === 'boolean') configThinking = cfg.thinking;
   // 被啟動參數鎖住時，面板送什麼都不動——逃生門要真的關得住
   if (typeof cfg.split === 'boolean' && !SPLIT_LOCKED_OFF) configSplit = cfg.split;
+  if (typeof cfg.trace === 'boolean') configTrace = cfg.trace;   // 26-09-02 ⑨：型別不對就忽略，比照上面三欄
+  if (typeof cfg.sysInFirstTurn === 'boolean') configSysInFirstTurn = cfg.sysInFirstTurn;   // 26-09-02 ③：同上
   return currentConfig();
 }
 
@@ -452,21 +473,15 @@ function emptyReplyNotice(reqNo, blockTypes, diag) {
   // 同樣動不了——「請你下次撞到時把終端機那行貼給我」在最需要的當下剛好做不到。
   // 所以不要靠人在慌亂時抄，讓橋自己留下來：額度回來之後誰都撈得到，事後補證一樣算數。
   // 只存結構不存內容（同 turn-log 的紀律）：診斷欄位、成因判定、result 那段文字，
-  // 沒有任何一句對話。上限與 turn-log 同一套，超過就只留最後 200 筆。
+  // 沒有任何一句對話。上限走共用的 appendJsonl（26-09-02 審核 B4）：超過 2MB 砍到只留最後 256KB（砍在行界）。
   try {
-    const file = path.join(__dirname, 'empty-replies.jsonl');
-    try {
-      if (fs.statSync(file).size > TURN_LOG_MAX_BYTES) {
-        fs.writeFileSync(file, fs.readFileSync(file, 'utf8').split('\n').slice(-200).join('\n'), 'utf8');
-      }
-    } catch {}
-    fs.appendFileSync(file, JSON.stringify({
+    appendJsonl(path.join(__dirname, 'empty-replies.jsonl'), {
       t: new Date().toISOString(), n: reqNo, label,
       blocks: blockTypes, stop_reason: diag.stop_reason, subtype: diag.subtype,
       num_turns: diag.num_turns, is_error: diag.is_error, costUsd: diag.costUsd,
       // 這格就是「額度用盡 vs 憑證失效」的分辨依據——沒有它，兩種病因在事後完全同形
       resultText: diag.resultText ?? null,
-    }) + '\n', 'utf8');
+    }, { keepBytes: 256 * 1024 });
   } catch (e) {
     // 不靜默吞：落檔壞掉會讓「事後撈得到」變成空頭支票，而那正是這段存在的理由
     console.warn(`[${PLUGIN_ID}] 空回覆落檔失敗：${String((e && e.message) || e).slice(0, 120)}`);
@@ -541,19 +556,35 @@ function sumMatching(fields, re) {
 //
 // 刻意選 JSONL：一行一筆、壞一行不影響其他行、隨時可以用 tail 看尾巴。
 // 寫入失敗一律吞掉——這是診斷用的東西，不該有能力讓對話失敗。
-const CACHE_LOG_MAX_BYTES = 2 * 1024 * 1024;   // 超過就從頭砍一半，不無限長大
+// JSONL 落檔＋rotation，**只有這一份**（26-09-02 審核 B4）。
+// 以前 empty-replies／cache-log／turn-log 各抄一份：statSync → 超過 2MB → split('\n').slice(-N) → 寫回，
+// 三種保留行數、零測試。turn-log 一筆帶 turns 陣列，長對話一筆 10KB 以上 → 2MB 約 200 筆 →
+// `slice(-200)` 幾乎砍不掉東西，之後每一發都把 2MB 讀進來再寫回去。
+// 現在：超過 maxBytes 就只留**最後 keepBytes 位元組**，而且砍在行界（從尾巴那段的第一個換行之後開始），
+// 砍完仍是合法 JSONL。多位元組 UTF-8 不會被切一半——行界是 0x0a，UTF-8 的續位元組不會是它。
+// rotation 失敗吞掉（檔不存在、讀不到都不該擋 append）；append 本身失敗**拋出去**，由呼叫端決定怎麼出聲——
+// 三個呼叫端各有自己的「不靜默」方式（cache-log 記進 cacheLogError、其餘 console.warn）。
+const JSONL_MAX_BYTES = 2 * 1024 * 1024;
+export function appendJsonl(file, entry, { maxBytes = JSONL_MAX_BYTES, keepBytes = Math.floor(maxBytes / 2) } = {}) {
+  try {
+    const st = fs.statSync(file);
+    if (st.size > maxBytes) {
+      const buf = fs.readFileSync(file);
+      const tail = buf.subarray(Math.max(0, buf.length - keepBytes));
+      const nl = tail.indexOf(0x0a);
+      // 尾巴那段開頭多半是半截行：從第一個換行之後留起。找不到換行＝整段都是半截，全部丟掉。
+      const kept = nl === -1 ? Buffer.alloc(0) : tail.subarray(nl + 1);
+      fs.writeFileSync(file, kept);
+    }
+  } catch {}
+  fs.appendFileSync(file, JSON.stringify(entry) + '\n', 'utf8');
+}
+
 let cacheLogError = null;   // 落檔失敗的原因，帶進回應裡（見下）
 function appendCacheLog(entry) {
   try {
-    const file = path.join(__dirname, 'cache-log.jsonl');
-    try {
-      const st = fs.statSync(file);
-      if (st.size > CACHE_LOG_MAX_BYTES) {
-        const kept = fs.readFileSync(file, 'utf8').split('\n').slice(-2000).join('\n');
-        fs.writeFileSync(file, kept, 'utf8');
-      }
-    } catch {}
-    fs.appendFileSync(file, JSON.stringify(entry) + '\n', 'utf8');
+    // 超過 2MB 留最後 1MB（26-09-02 B4 起按位元組砍；以前留 2000 行）
+    appendJsonl(path.join(__dirname, 'cache-log.jsonl'), entry, { keepBytes: 1024 * 1024 });
     cacheLogError = null;
   } catch (e) {
     // 吞掉例外是對的（診斷用的東西不該讓對話失敗），但**不能靜默**——
@@ -700,19 +731,31 @@ function recordUsage(usage, ctx) {
   // 而那種稀釋看起來像「快取效果變差」，是會害人查錯方向的假訊號。
   if (usage) {
     cacheTally.requests++;
-    cacheHistory.push({ atMs: Date.now(), cacheWrite, cacheRead });
+    // model 一起記（26-09-02 審核 C10b）：cacheRoi 按帳本最後一筆的 model 查價——沒這格，priceFor 永遠只吃到預設的 Opus 4.6
+    cacheHistory.push({ atMs: Date.now(), cacheWrite, cacheRead, model: ctx.modelId });
     if (cacheHistory.length > CACHE_HISTORY_MAX) cacheHistory.shift();
     // 這一發真的送到了 → 它才有資格當下一發的比較基準（見 pendingTurnFps 註解）
     commitTurnBaseline();
     if (ctx.splitApplied) cacheTally.splitApplied++;
     // 不拆的理由要留最後一筆——面板的警告靠它把「沒生效」講成「為什麼沒生效」。
     else if (ctx.splitReason) cacheTally.lastSkipReason = ctx.splitReason;
+    // ③ 面板「拆塊」那行要印「快取點 2 個：第 s1／s2 則」——只在系統提示走第一則且真的拆到時留座標；關掉就清（不留舊座標騙人）
+    if (ctx.splitSysFirst && ctx.splitApplied) {
+      cacheTally.lastSplitS1 = ctx.splitS1 ?? null;
+      cacheTally.lastSplitS2 = ctx.splitS2 ?? null;
+    } else {
+      delete cacheTally.lastSplitS1;
+      delete cacheTally.lastSplitS2;
+    }
     if (ctx.splitDivergence !== undefined) cacheTally.lastDivergence = ctx.splitDivergence;
     if (ctx.splitZone !== undefined) cacheTally.lastDivergenceZone = ctx.splitZone;
     if (ctx.systemDrift !== undefined) cacheTally.lastSystemDrift = ctx.systemDrift;
     // 26-09-02（審核 C9）：recurring（來回切換 vs 每則新值）後端早就算了，面板卻拿不到——
     // 前端只能印一句寫死的舊指認。把最近一次的布林暴露給 cacheSummary。
     if (ctx.sysRecurring !== undefined) cacheTally.lastSystemRecurring = ctx.sysRecurring;
+    // 26-09-02（審核 C10d，⑫ 後端半邊）：訂閱使用者付的是 5h 額度不是美元——最近一發**有值**的留給面板。
+    // 這一發沒帶（SDK 有些版本不回 rate_limits）就保留上一個有值的，不歸零。
+    if (flat.fiveHourPct != null) cacheTally.lastQuota5hPct = flat.fiveHourPct;
     cacheTally.input += inTok;
     cacheTally.cacheRead += cacheRead;
     cacheTally.cacheWrite += cacheWrite;
@@ -768,6 +811,8 @@ function recordUsage(usage, ctx) {
     sysDrift: ctx.systemDrift ?? null,
     sysHash: ctx.sysHash ?? null,
     sysRecurring: ctx.sysRecurring ?? null,
+    // ③ 系統提示走第一則的那幾發才落：sysFirst＋兩個快取點座標（三塊那發 s1 是 null）。關閉時**沒有這幾個鍵**。
+    ...(ctx.splitSysFirst ? { sysFirst: true, s1: ctx.splitS1 ?? null, s2: ctx.splitS2 ?? null } : {}),
     // 26-09-02 組成表彙總（CX-260902-01）：系統區／對話／注入各多少則多少字元、跟上一發幾則變幾則移位。
     // 只有數字不含內容。逐則明細在 turn-log.jsonl。
     comp: ctx.comp ?? null,
@@ -900,7 +945,7 @@ function strictHeaderEnd(messages) {
   return messages.length;
 }
 
-function rescueHeaderEnd(messages) {
+function rescueHeaderEnd(messages, prevFps = null) {
   if (!Array.isArray(messages)) return 0;
   const firstBot = messages.findIndex(m => m && m.role === 'assistant');
   if (firstBot < 0) {
@@ -926,17 +971,43 @@ function rescueHeaderEnd(messages) {
   // 判準：設定區塊是 user/system 交錯的（每塊設定後面還有別的設定），
   // 而**對話一旦開始就不會再夾 system**——注入都排在對話之後。
   // 所以從 firstBot 往回收，收到最後一則 system 為止；那之後的都是對話。
+  //
+  // 26-09-02 第二波 b ②（審核 C 第 3 條）：「對話開始後不會再夾 system」對排在對話後的注入成立，
+  // **對 @D 深度注入不成立**——玩家先發言、@D 深度 ≥2 時，那則 system 剛好落在第一個 assistant 前。
+  // 舊 walkback 碰到它就停，把玩家第一句吃進 systemPrompt；下一發 @D 跟著對話往後走、自己跳回對話區，
+  // systemPrompt 每次位移就變、整包快取重建。兩層修法（都保守：寧可系統提示少一段，也不把玩家的話當系統提示送）：
+  //   ① 有基準時查它在上一發的位置（composeTurns 的 vs，判準只有一份）：**moved＝跟著對話走的注入，跳過它繼續往回走**；
+  //      same／new／沒基準 → 維持現行停下（常駐條目兩發同位置照舊進 header，不誤傷）。
+  //   ② 附加安全閘（第一發就生效、不用基準）：緊貼第一個 assistant 的那群 system，前面若是「像玩家發言的非空 user、
+  //      而且它前面已經有 system（header 區已開始）」→ 那群 system 是玩家第一句之後的注入，一起跳過。
+  //      「像玩家發言」用 kindOfTurn 那把尺（'---'、'['、'<' 開頭的算設定），形狀 A 的 usr('---') 因此不會被誤判；
+  //      「前面已經有 system」排除 E-1 那種 usr('設定') 在第 0 則的形狀。
+  const vs = Array.isArray(prevFps) && prevFps.length ? composeTurns(messages, 0, prevFps).turns.map(t => t.vs) : null;
+  let trailStart = firstBot;
+  while (trailStart - 1 >= 0 && (!messages[trailStart - 1] || messages[trailStart - 1].role === 'system')) trailStart--;
+  let before = trailStart - 1;
+  while (before >= 0 && !messages[before]) before--;
+  const trailIsInjection = trailStart < firstBot && before >= 0
+    && messages[before].role === 'user' && !blankContent(messages[before].content)
+    && kindOfTurn(messages[before], before, 0) === 'dlg'
+    && messages.slice(0, before).some(m => m && m.role === 'system');
   let end = firstBot;
   for (let i = firstBot - 1; i >= 0; i--) {
     const m = messages[i];
     if (!m) continue;
-    if (m.role === 'system') break;   // 碰到設定就停，這裡就是 header 的盡頭
-    end = i;                          // 這則不是 system 且後面沒 system → 它是對話
+    if (m.role === 'system') {
+      if (vs && vs[i] === 'moved' && !blankContent(m.content)) continue;   // ① 上一發在別的位置＝注入，不是設定
+      if (trailIsInjection && i >= trailStart) continue;                     // ② 玩家第一句後面那群 system
+      break;   // 碰到設定就停，這裡就是 header 的盡頭
+    }
+    end = i;                          // 這則不是 system 且後面沒（設定型的）system → 它是對話
   }
   return end;
 }
 
-function parseMessages(messages) {
+// opts（26-09-02 第二波 b ②）：prevFps＝上一發的逐則指紋、prevKey＝上一發的對話識別（conversationKey）。
+// 只有救援路徑用得到（判 system 是不是 moved）；不給就是無基準、行為跟以前一樣。
+function parseMessages(messages, { prevFps = null, prevKey } = {}) {
   const strictEnd = strictHeaderEnd(messages);
   const strict = parseWithHeaderEnd(messages, strictEnd);
   if (strict.systemPrompt || !messages.some(m => m && m.role === 'system')) return strict;
@@ -969,7 +1040,15 @@ function parseMessages(messages) {
     if (!前面有system) return strict;   // 開頭是純對話＝真的沒有 header，不要硬救
   }
 
-  return parseWithHeaderEnd(messages, rescueHeaderEnd(messages));
+  const end = rescueHeaderEnd(messages, prevFps);
+  let out = parseWithHeaderEnd(messages, end);
+  // 基準要綁對話（跟 evaluateBreakpoint 同一條紀律）：算出來的 header 若對不上上一發的 key，那份基準是別的對話的，
+  // 不拿它判 moved——用無基準重算一次。key 得先有 systemPrompt 才算得出來，所以只能算完再驗、驗不過再重來一次。
+  if (prevFps && prevKey !== undefined && conversationKey(out.systemPrompt) !== prevKey) {
+    const end2 = rescueHeaderEnd(messages, null);
+    if (end2 !== end) out = parseWithHeaderEnd(messages, end2);
+  }
+  return out;
 }
 
 // ── 拆塊第一階：只量不動（26-08-02）────────────────
@@ -979,7 +1058,7 @@ function parseMessages(messages) {
 //   所以先讓儀器上線、拿真實對話驗斷點算得對不對，數字對了再讓修法上線。
 //   （今天的帳：合成題測不到會動的場景；沒有真實基準就改行為，等於拿使用者當測試環境。）
 //
-// 開關：TCB_TURN_TRACE=1。預設關，關著的時候這段一步都不走。
+// 開關（歷史）：原本 TCB_TURN_TRACE=1 才走；26-09-02 起結構永遠落檔，內容欄位由 traceEnabled() 管。
 let prevTurnFps = null;   // 上一發的逐則指紋（記憶體即可，橋重啟歸零＝第一發走 fallback，安全）
 // **基準要綁對話**（26-08-28 第五種變形，外部回報催出來的）：
 // prevTurnFps 原本是純全域，換一個聊天／換角色卡照樣拿來比——第一個對不上的位置
@@ -1005,30 +1084,48 @@ let pendingTurnKey = null;
 // 跟指紋基準同一條紀律：**失敗的請求不提交**，否則下一發拿沒送出去的東西比。
 let prevRewriteSnap = null;      // { index, text }
 let pendingRewriteSnap = null;
-const splitState = { sticky: null };   // 上次實際用過的斷點（黏住用；重啟歸零＝重新建一次，安全）
-const TURN_LOG_MAX_BYTES = 2 * 1024 * 1024;
+const splitState = { sticky: null, sticky1: null };   // 上次實際用過的斷點（黏住用；重啟歸零＝重新建一次，安全）；sticky1＝多斷點的舊塊座標 s1（26-09-02 ③，只在開關開時有值）
+// 26-09-02（審核 A5＋A10）：splitState 裡的 sticky／systemHash／systemHashSeen 也走 pending。
+// 8/28 把指紋基準改成「成功才提交」，但這三格還是**送出前當場寫**——失敗那發（額度不足、斷線）
+// 算出的 jump、量到的系統提示雜湊、換 key 時的清空，全都直接落地不回滾，跟 8/28 修掉的是同一型病。
+// 現在 evaluateBreakpoint 開一份暫存，trackSystemPromptPending／stickyBreakpointPending 寫暫存，
+// commitTurnBaseline 一起提交；失敗那發的暫存被下一發 evaluateBreakpoint 直接覆蓋＝丟棄。
+let pendingSplit = null;   // { sticky, systemHash, systemHashSeen }
+function ensurePendingSplit() {
+  return pendingSplit || (pendingSplit = {
+    sticky: splitState.sticky,
+    sticky1: splitState.sticky1 ?? null,
+    systemHash: splitState.systemHash,
+    systemHashSeen: [...(splitState.systemHashSeen || [])],
+  });
+}
 // **一發只准算一次**：量測模式與拆塊模式都要用這個結果，各自算一次的話，
 // 第二次會拿「這一發自己」當基準（prevTurnFps 已被第一次更新掉），分歧點變成整串長度、
 // 斷點直接跑到最尾巴——而那看起來像「這發超級穩定」，是會騙人的那種錯。
 export function evaluateBreakpoint(messages, headerEnd, convKey) {
-  // 對話換了就丟掉基準——拿別的對話當基準，算出來的分歧點是假的（見 prevTurnKey 註解）。
+  // 對話換了就不拿舊基準比——拿別的對話當基準，算出來的分歧點是假的（見 prevTurnKey 註解）。
   // convKey 拿不到時（呼叫端沒給）維持舊行為，不要在這裡自己造一個半吊子的識別。
-  if (convKey !== undefined && convKey !== prevTurnKey) {
-    prevTurnFps = null;
-    prevTurnKey = convKey;
-    // 26-09-02（審核 C5）：換對話時 sticky 斷點與雜湊歷史也要歸零。
-    // sticky 不清：新對話黏在舊對話的第 N 則上，held 期間少納一截進穩定塊，要再玩到 gain≥40 才跳。
-    // systemHashSeen 不清：A→B→A 切回來被判 recurring「來回切換」，其實只是換了聊天。
-    // systemHash **保留**——換對話後第一發報一次「系統提示變了」是真的，該報。
-    splitState.sticky = null;
-    splitState.systemHashSeen = [];
-  }
-  const decision = decideBreakpoint(messages, prevTurnFps, {
+  // **但不在這裡改 prevTurnKey／prevTurnFps／splitState**（26-09-02 審核 A5／A10）：這一發若失敗，
+  // 舊對話的基準與 sticky 要還在——使用者換到新聊天第一發撞額度、切回舊聊天，舊的一切不該被清掉。
+  const keyChanged = convKey !== undefined && convKey !== prevTurnKey;
+  const baseFps = keyChanged ? null : prevTurnFps;
+  const baseSnap = keyChanged ? null : prevRewriteSnap;
+  // 26-09-02（審核 C5）：換對話時 sticky 斷點與雜湊歷史也要歸零——放暫存，成功才提交。
+  // sticky 不清：新對話黏在舊對話的第 N 則上，held 期間少納一截進穩定塊，要再玩到 gain≥40 才跳。
+  // systemHashSeen 不清：A→B→A 切回來被判 recurring「來回切換」，其實只是換了聊天。
+  // systemHash **保留**——換對話後第一發報一次「系統提示變了」是真的，該報。
+  pendingSplit = {
+    sticky: keyChanged ? null : splitState.sticky,
+    sticky1: keyChanged ? null : (splitState.sticky1 ?? null),
+    systemHash: splitState.systemHash,
+    systemHashSeen: keyChanged ? [] : [...(splitState.systemHashSeen || [])],
+  };
+  const decision = decideBreakpoint(messages, baseFps, {
     headerEnd,
     safetyTurns: Math.max(0, parseInt(process.env.TCB_SAFETY_TURNS, 10) || 1),
     fallbackDepth: Math.max(1, parseInt(process.env.TCB_FALLBACK_DEPTH, 10) || 8),
   });
-  const prevFps = prevTurnFps;
+  const prevFps = baseFps;
   // 算好先放著，**等請求真的成功再由 commitTurnBaseline() 提交**（見 pendingTurnFps 註解）
   pendingTurnFps = fingerprintTurns(messages);
   pendingTurnKey = convKey !== undefined ? convKey : prevTurnKey;
@@ -1044,16 +1141,16 @@ export function evaluateBreakpoint(messages, headerEnd, convKey) {
   const ri = shift?.kind === 'rewrite' ? shift.index : null;
   if (typeof ri === 'number' && Array.isArray(messages) && messages[ri]) {
     const curText = textOfTurn(messages[ri]);
-    if (prevRewriteSnap && prevRewriteSnap.index === ri) {
-      rewriteDiff = shortDiff(prevRewriteSnap.text, curText);
+    if (baseSnap && baseSnap.index === ri) {
+      rewriteDiff = shortDiff(baseSnap.text, curText);
     }
-    // 完整前後兩版只在診斷模式落檔（TCB_TURN_TRACE=1）。
+    // 完整前後兩版只在診斷模式落檔（面板 trace 或 TCB_TURN_TRACE=1）。
     // 為什麼要分層：差異片段（24 字元上限）多數情況就夠認出是時間戳還是狀態欄，
     // 那個預設就給；但真的查不出來的疑難雜症需要看完整原文，而那是使用者的對話內容——
     // **預設不落檔，要看的人自己開**。這條線畫在「隱私」與「診斷的成本不該由使用者付」之間：
     // 前者贏在預設值，後者贏在「有需要時打得開，而且不用改碼」。
-    if (process.env.TCB_TURN_TRACE === '1' && prevRewriteSnap && prevRewriteSnap.index === ri) {
-      rewriteFull = { index: ri, before: prevRewriteSnap.text, after: curText };
+    if (traceEnabled() && baseSnap && baseSnap.index === ri) {
+      rewriteFull = { index: ri, before: baseSnap.text, after: curText };
     }
     pendingRewriteSnap = { index: ri, text: curText };
   } else {
@@ -1072,9 +1169,66 @@ export function commitTurnBaseline() {
   prevTurnFps = pendingTurnFps;
   prevTurnKey = pendingTurnKey;
   prevRewriteSnap = pendingRewriteSnap;
+  // sticky／systemHash／systemHashSeen 同一刻提交（26-09-02 A5＋A10）
+  if (pendingSplit) {
+    splitState.sticky = pendingSplit.sticky;
+    splitState.sticky1 = pendingSplit.sticky1 ?? null;
+    splitState.systemHash = pendingSplit.systemHash;
+    splitState.systemHashSeen = pendingSplit.systemHashSeen;
+    pendingSplit = null;
+  }
   pendingRewriteSnap = null;
   pendingTurnFps = null;
   return true;
+}
+
+/**
+ * 系統提示漂移偵測——寫進這一發的暫存，不直接動 splitState（26-09-02 審核 A10）。
+ * trackSystemPrompt 本身照舊就地寫它拿到的 state，所以餵它一份暫存的視圖，量完把視圖抄回暫存。
+ */
+export function trackSystemPromptPending(systemPrompt) {
+  const p = ensurePendingSplit();
+  const probe = { systemHash: p.systemHash, systemHashSeen: p.systemHashSeen };
+  const r = trackSystemPrompt(systemPrompt, probe);
+  p.systemHash = probe.systemHash;
+  p.systemHashSeen = probe.systemHashSeen;
+  return r;
+}
+
+/**
+ * 黏住斷點——stickyBreakpoint 是純函式，建議的新 sticky 寫進暫存，成功才提交（26-09-02 審核 A5）。
+ *
+ * multi（26-09-02 ③，系統提示走第一則時開）：同時記第二個座標 s1（舊塊的斷點），回傳多一個 `s1` 欄：
+ *   s2 照現行 sticky 邏輯（held／jump／forced／new）；
+ *   **jump 時 s1 ← 舊 s2**——舊塊逐字沿用、只重寫 s1..s2 那段增量（spike δ Q3：舊塊不動就命中）；
+ *   held／skip 兩座標不動；new（第一次）沒有 s1；
+ *   forced（變動點落進穩定塊）：舊 s1 塊若沒被動到（s1 ≤ divergence）就留著，否則清掉。
+ *   s1 一律要落在 (0, s2) 內，不然就當沒有（三塊）。
+ * multi 關著（預設）：回傳跟以前一模一樣、s1 歸零——關過一次再開，座標重新累積，不拿舊座標切。
+ */
+export function stickyBreakpointPending(decision, jumpGain, { multi = false } = {}) {
+  const p = ensurePendingSplit();
+  const held = stickyBreakpoint(decision, { sticky: p.sticky }, jumpGain);
+  const prev1 = p.sticky1 ?? null;
+  const prev2 = p.sticky;
+  p.sticky = held.nextSticky;
+  if (!multi) { p.sticky1 = null; return held; }
+  let s1;
+  switch (held.mode) {
+    case 'skip':   p.sticky1 = prev1; return { ...held, s1: prev1 };   // 這發不拆，座標原地不動
+    case 'held':   s1 = prev1; break;
+    case 'jump':   s1 = prev2; break;
+    case 'forced': s1 = (prev1 != null && decision.divergence != null && prev1 <= decision.divergence) ? prev1 : null; break;
+    default:       s1 = null;   // new
+  }
+  if (s1 != null && !(s1 > 0 && s1 < held.index)) s1 = null;
+  p.sticky1 = s1;
+  return { ...held, s1 };
+}
+
+/** 測試用：已提交的跨請求狀態長什麼樣（唯讀拷貝）。 */
+export function __splitStateSnapshot() {
+  return { sticky: splitState.sticky, sticky1: splitState.sticky1 ?? null, systemHash: splitState.systemHash, systemHashSeen: [...(splitState.systemHashSeen || [])] };
 }
 
 /** 測試用：把模組層級的基準清乾淨，讓每組測試從同一個起點開始。 */
@@ -1083,6 +1237,13 @@ export function __resetTurnBaseline() {
   prevTurnKey = null;
   pendingTurnFps = null;
   pendingTurnKey = null;
+  prevRewriteSnap = null;
+  pendingRewriteSnap = null;
+  pendingSplit = null;
+  splitState.sticky = null;
+  splitState.sticky1 = null;
+  splitState.systemHash = undefined;
+  splitState.systemHashSeen = [];
 }
 
 /** 對話識別：header 的雜湊。同一張卡＋同一組設定＝同一個對話串。 */
@@ -1097,7 +1258,7 @@ function traceTurns(messages, headerEnd, reqNo, evaluated, splitInfo, compIn) {
   // 會碰到內容的兩格——每則的 head（開頭 30 字）、split.reason 裡變動點那則的開頭片段——
   // 只在診斷模式落檔；預設模式的 split.reason 先把片段剝掉（stripContentHead）再落，console 那行也只在診斷模式。
   // （cache-log 的 rewriteDiff——前後各 24 字＋前後文 36 字——是另一條線，預設就落，不歸這段管。）
-  const trace = process.env.TCB_TURN_TRACE === '1';
+  const trace = traceEnabled();   // 26-09-02 ⑨：面板 /config 的 trace 欄或環境變數，兩者其一
   try {
     const { decision, prevFps, fps } = evaluated || evaluateBreakpoint(messages, headerEnd);
     const comp = compIn || composeTurns(messages, headerEnd, prevFps, { fps });
@@ -1132,14 +1293,8 @@ function traceTurns(messages, headerEnd, reqNo, evaluated, splitInfo, compIn) {
         ...(trace ? { head: contentHead(messages[i] && messages[i].content) } : {}),
       })),
     };
-    const file = path.join(__dirname, 'turn-log.jsonl');
-    try {
-      const st = fs.statSync(file);
-      if (st.size > TURN_LOG_MAX_BYTES) {
-        fs.writeFileSync(file, fs.readFileSync(file, 'utf8').split('\n').slice(-200).join('\n'), 'utf8');
-      }
-    } catch {}
-    fs.appendFileSync(file, JSON.stringify(entry) + '\n', 'utf8');
+    // 超過 2MB 留最後 1MB、砍在行界（26-09-02 B4：以前留 200 行，長對話一筆 10KB 以上時幾乎砍不掉東西）
+    appendJsonl(path.join(__dirname, 'turn-log.jsonl'), entry, { keepBytes: 1024 * 1024 });
     if (trace) {
       console.log(`[${PLUGIN_ID}] 斷點量測 #${reqNo}：${decision.source} 斷在第 ${decision.index}/${messages.length} 則` +
                   `${decision.divergence !== null ? `（第一個變動在 ${decision.divergence}）` : ''}`);
@@ -1341,7 +1496,9 @@ function contentHead(content, max = 30) {
   return flat.length > max ? flat.slice(0, max) + '…' : flat;
 }
 
-function splitPromptBlocks(parsed, cut, modelId) {
+// opts（26-09-02 第二波 b ③）：sysInFirstTurn＝系統提示走對話第一則（開時回 3 或 4 塊，見下）；cut1＝舊塊斷點 s1（historyTurns 座標）。
+// 不給 opts＝跟以前一模一樣的兩塊。
+function splitPromptBlocks(parsed, cut, modelId, { sysInFirstTurn = false, cut1 = null } = {}) {
   const turns = parsed && parsed.historyTurns;
   if (!Array.isArray(turns) || turns.length === 0) return null;
   if (!(cut > 0) || cut >= turns.length) return null;   // 沒東西可切或整段都算穩定＝不拆
@@ -1356,12 +1513,34 @@ function splitPromptBlocks(parsed, cut, modelId) {
   // 貼一個低於門檻的標記不是「少省一點」，是**兩頭落空**——標記靜默失效，
   // 而其餘內容因為我們宣告了不貼、也拿不到斷點。不拆反而讓整包維持單一前綴。
   // 這道閘擋的是舊版用「則數」把關放行的那一型（實案：5 則＝226 字元）。
-  if (!meetsCacheMinimum(stable, modelId)) return null;
+  // 26-09-02 第二波 b ④：門檻算「到斷點為止的整個前綴」＝系統提示＋穩定塊，不是穩定塊自身
+  // （spike δ Q2：784 token 的塊排在 11k 前綴後照樣建了快取）。只加橋看得到的 systemPrompt，SDK 內建句不算。
+  if (!meetsCacheMinimum(stable, modelId, parsed.systemPrompt || '')) return null;
 
-  return [
-    { type: 'text', text: stable, cache_control: { type: 'ephemeral', ttl: '1h' } },
-    { type: 'text', text: moving },
-  ];
+  const stableBlock = { type: 'text', text: stable, cache_control: { type: 'ephemeral', ttl: '1h' } };
+  const movingBlock = { type: 'text', text: moving };
+  // 關（預設）、或根本沒有系統提示可搬 → 跟以前一模一樣的兩塊
+  if (!sysInFirstTurn || !parsed.systemPrompt) return [stableBlock, movingBlock];
+
+  // ③ 開：系統提示**原樣**當第一塊——不貼 cache_control、不加任何前綴或標記（它在後面斷點的前綴裡，一樣被蓋到）。
+  // 有 s1 就切四塊 [sys, 舊塊✓, 新增段✓, 會動塊]：舊塊逐字不動 → 跳斷點只重寫增量。
+  // 不變式擴成：除 sys 外所有塊依序接回 ＝ 原始 prompt 逐字（舊塊＋新增段＝穩定塊，穩定塊＋會動塊＝prompt，上面已驗）。
+  const sysBlock = { type: 'text', text: parsed.systemPrompt };
+  if (cut1 > 0 && cut1 < cut) {
+    const old = `<history>\n${turns.slice(0, cut1).join('\n')}\n`;
+    const add = `${turns.slice(cut1, cut).join('\n')}\n`;
+    // 舊塊的斷點也要過門檻（算到 s1 為止的前綴＝系統提示＋舊塊，跟 ④ 同一把尺）——
+    // 不到門檻的標記會被靜默忽略、還白佔一個配額，那就退化成三塊，穩定塊仍是 0..s2
+    if (old + add === stable && meetsCacheMinimum(old, modelId, parsed.systemPrompt)) {
+      return [
+        sysBlock,
+        { type: 'text', text: old, cache_control: { type: 'ephemeral', ttl: '1h' } },
+        { type: 'text', text: add, cache_control: { type: 'ephemeral', ttl: '1h' } },
+        movingBlock,
+      ];
+    }
+  }
+  return [sysBlock, stableBlock, movingBlock];
 }
 
 // 多塊 prompt 包成串流輸入（形狀與 makeImagePrompt 同源——SDK 只吃 user 角色，
@@ -1424,6 +1603,99 @@ function readBody(req) {
     req.on('end', () => finish(resolve, Buffer.concat(chunks).toString('utf8')));
     req.on('error', () => finish(resolve, null));
   });
+}
+
+// ── 兩條回應路徑的共同部分（26-09-02 審核 B3）────────────────────────────
+// 串流／非串流原本各抄一份：SDK options（30 行，唯一差別 includePartialMessages）、result 訊息收取（20 行，逐字相同）、
+// recordUsage 的 ctx（20 行，差 mode／aborted／suffix）。26-08-01 與 26-08-27 兩次「只改一半」都是這個形狀，
+// parity 測試只堵得住 ctx 那一種。抽成三支之後**結構上不可能只改一半**——差異（串流的 partial chunk、
+// 非串流的 finish_reason）留在各自路徑，這裡只放兩邊必須一模一樣的東西。
+
+/** 送進 SDK query 的 options。兩條路徑唯一的差別是串流要 includePartialMessages。 */
+export function buildQueryOptions(modelId, systemPrompt, { stream, sysInFirstTurn = false } = {}) {
+  return {
+    // ③ 開關開：系統提示已放進 prompt 那則 user 的 content[0]，這裡**不傳**（SDK 的內建句仍在，那不歸我們管）。
+    // 一處改、兩條路徑都生效——這正是 26-09-02 把 options 抽成一支的理由。
+    systemPrompt: sysInFirstTurn ? undefined : systemPromptForSdk(systemPrompt),
+    tools: [],
+    // 省掉自動標題生成（26-08-01 實測發現）。
+    // SDK 型別原文：提供 title 就「skips automatic title generation」。
+    // 不給的話，每次請求 SDK 會另外叫一次 Haiku 去生標題——實測它吃 527 tokens 輸入，
+    // 比主模型那次（161）還多三倍，佔總成本約四成。那個標題從頭到尾沒有任何用途。
+    // 設 TCB_AUTO_TITLE=1 可退回舊行為（重新讓 SDK 自動生標題），供對帳。
+    title: process.env.TCB_AUTO_TITLE === '1' ? undefined : 'SillyTavern bridge',
+    maxTurns: 1,
+    model: modelId,
+    permissionMode: 'dontAsk',
+    persistSession: persistSessionOption(),
+    ...(stream ? { includePartialMessages: true } : {}),
+    settingSources: [],
+    ...thinkingOption(),
+    ...effortOption(),
+  };
+}
+
+/**
+ * 收取 result 訊息：成本、自帶的 usage、診斷五欄、result 原文，並在出錯時印 SDK 原文。
+ * diag 就地寫入（空回覆診斷要用），回 { costUsd, resultUsage, resultModelUsage }。
+ */
+export function absorbResult(msg, diag, reqNo) {
+  // 欄位名相容：SDK 型別寫的是 total_cost_usd，舊版是 cost_usd。
+  // 只讀 cost_usd 會讓成本永遠是 0——而 costUsd===0 正是「模型沒被叫起來」
+  // 的診斷指紋之一，讀錯欄位會讓那條判準對所有空回覆誤診（26-08-01 實測抓到）。
+  const costUsd = Number(msg.total_cost_usd ?? msg.cost_usd) || 0;
+  diag.costUsd = costUsd;   // 「零成本」是「模型根本沒被叫起來」的指紋之一
+  diag.subtype = msg.subtype;
+  diag.num_turns = msg.num_turns;
+  diag.is_error = msg.is_error;
+  // result 自己帶的文字（26-08-03 加，外部使用者回報後補）：額度用盡時 SDK
+  // **不拋例外**、照樣回一個 result，指紋跟憑證失效一模一樣——唯一能分辨的
+  // 線索就在這段文字裡。沒有它，兩種病因在畫面上完全同形。
+  if (typeof msg.result === 'string' && msg.result.trim()) diag.resultText = msg.result.slice(0, 300);
+  dumpResultOnError(reqNo, msg);   // 出錯才印，正常路徑零噪音
+  // usage 直接從 result 訊息拿——不必事後呼叫 API（那時 transport 已關，
+  // 會拿到 'ProcessTransport is not ready for writing'）。
+  return { costUsd, resultUsage: msg.usage || null, resultModelUsage: msg.modelUsage || null };
+}
+
+/** 優先用 result 訊息自帶的 usage；都沒有才退回主動查詢（readUsage 會把失敗原因記在模組狀態裡）。 */
+async function resolveUsage(absorbed, q) {
+  if (absorbed && (absorbed.resultUsage || absorbed.resultModelUsage)) {
+    return { usage: absorbed.resultUsage, modelUsage: absorbed.resultModelUsage };
+  }
+  return readUsage(q);
+}
+
+/**
+ * recordUsage 的 ctx。base 是兩條路都有的材料（splitInfo／evaluated／systemDrift／comp 整包丟進來，
+ * 這裡負責挑欄），mode／aborted／suffix 是路徑各自的。
+ * 欄位集合由 record-usage-parity.test 釘住——加欄位加在這裡，兩條路同時拿到。
+ */
+export function usageCtx(base, { mode, aborted = false, suffix = aborted ? ' (讓位/斷線)' : '' } = {}) {
+  const { reqNo, modelId, effort, shape, imgCount, costUsd, splitInfo, evaluated, systemDrift, comp } = base;
+  return {
+    reqNo, mode, modelId, effort, shape, imgCount, costUsd,
+    // 26-09-02（審核 A4）：帳上要看得出這發被打斷（console 後綴＋cache-log 的 aborted），兩條路都帶
+    aborted, suffix,
+    splitApplied: splitInfo.applied,
+    splitReason: splitInfo.reason,
+    splitDivergence: splitInfo.divergence ?? null,
+    splitZone: splitInfo.zone ?? null,
+    // ③ 系統提示走第一則：這發有沒有搬、兩個快取點在哪（關閉時三格都 null，cache-log 不落）
+    splitSysFirst: splitInfo.sysFirst ?? null,
+    splitS1: splitInfo.s1 ?? null,
+    splitS2: splitInfo.s2 ?? null,
+    // 改寫診斷落檔（26-08-29）：差異片段預設就落，完整前後兩版要開診斷模式。
+    // 橋是唯一看得到實際送出內容的位置——外部工具攔不到 payload 的時候，這裡是唯一的證據源。
+    shiftKind: evaluated?.shift?.kind ?? null,
+    shiftDropped: evaluated?.shift?.dropped ?? null,
+    rewriteDiff: evaluated?.rewriteDiff ?? null,
+    rewriteFull: evaluated?.rewriteFull ?? null,
+    systemDrift: systemDrift.changed,   // 26-08-27：串流那條原本漏了，面板因此對使用者說「還沒記到原因」
+    sysHash: systemDrift.hash,
+    sysRecurring: systemDrift.recurring,
+    comp: comp.summary,   // 26-09-02 組成表彙總（CX-260902-01）
+  };
 }
 
 // 把 SDK 的錯誤翻成使用者能處置的一句話。**翻譯後面一律括號保留原文**——
@@ -1550,7 +1822,8 @@ async function handleChatCompletions(req, res) {
     current = ticket;
 
     modelId = requestModel || 'claude-opus-4-6[1m]';
-    const parsedMsgs = parseMessages(messages);
+    // ②：救援路徑要拿上一發的指紋判「這則 system 是不是跟著對話移位」；prevTurnKey 讓它自己驗基準是不是同一個對話
+    const parsedMsgs = parseMessages(messages, { prevFps: prevTurnFps, prevKey: prevTurnKey });
     const { systemPrompt, prompt, images, headerEnd } = parsedMsgs;
     // 斷點：量測模式與拆塊模式共用同一次計算（兩邊各算一次會讓第二次拿自己當基準，
     // 見 evaluateBreakpoint 的註解）。兩個開關都關著就完全不算，不付這個成本。
@@ -1586,18 +1859,22 @@ async function handleChatCompletions(req, res) {
     completionId = `chatcmpl-${randomUUID().slice(0, 8)}`;
     // 有圖 → 串流輸入模式（SDK 才收得到 image block）；沒圖 → 維持原本的字串 prompt
     const hasImages = images.length > 0;
+    // ③ 系統提示走對話第一則：開關開、而且真的有系統提示可搬才算（沒有就跟關一樣）。這一發從頭到尾用同一個值。
+    const sysFirst = sysInFirstTurnEnabled() && !!systemPrompt;
 
     // ── 拆塊（26-08-03 起預設開，面板可關；開關語義見 splitEnabled 上方）─────
     // 把對話流切兩塊、穩定那塊貼 cache_control(1h)，讓快取斷點落在「會動區之外」。
     // 三道閘任何一道不過就退回原本的單一字串——**寧可不省，也不要送出被動過的內容**。
     let splitBlocks = null;
     const splitInfo = { enabled: splitEnabled(), applied: false, cut: null, stableChars: null, movingChars: null, reason: null, sticky: null };
+    // ③ 開時才多這三格（關時 splitInfo／turn-log／cache-log 的形狀跟以前一模一樣）：s1／s2＝兩個快取點（historyTurns 座標）
+    if (sysFirst) { splitInfo.sysFirst = true; splitInfo.s1 = null; splitInfo.s2 = null; }
 
     // 系統提示有沒有在變（26-08-27，CX-260827-01 第四刀）。
     // 拆塊只管對話那一段，但 system 排在更前面——它動一個字，後面整包作廢，
     // 而症狀跟「拆塊沒生效」在讀數上完全同形（cacheRead 都是 0）。這一格是為了分得出來。
     // 只存雜湊不存原文（使用者的角色卡與預設不落盤）。
-    const systemDrift = trackSystemPrompt(systemPrompt, splitState);
+    const systemDrift = trackSystemPromptPending(systemPrompt);   // 寫暫存，成功才提交（26-09-02 A10）
     if (systemDrift.changed) {
       cacheTally.systemDriftCount = (cacheTally.systemDriftCount || 0) + 1;
       // 26-09-01：這裡原本寫「常見來源：…（時間戳最常見）」——那是指認，不是陳述。
@@ -1624,30 +1901,46 @@ async function handleChatCompletions(req, res) {
     } else if (splitInfo.enabled && evaluated) {
       // 黏住斷點：貼標記的塊必須逐字不變才命中，所以不能讓斷點跟著對話一路前移
       // （26-08-03 spike 定案；沒有這層的話每發都在重建，五發實測全部只命中系統包）
-      const held = stickyBreakpoint(evaluated.decision, splitState,
-        Math.max(1, parseInt(process.env.TCB_JUMP_GAIN, 10) || 40));
-      splitInfo.sticky = held;
+      // ③ 開關開時 jumpGain 預設 6（跳斷點只重寫增量、代價小，門檻可以低）；關時維持 40。TCB_JUMP_GAIN 仍可覆蓋兩者。
+      const held = stickyBreakpointPending(evaluated.decision,
+        Math.max(1, parseInt(process.env.TCB_JUMP_GAIN, 10) || (sysFirst ? 6 : 40)),
+        { multi: sysFirst });   // 寫暫存，成功才提交（26-09-02 A5）；multi＝同時記舊塊座標 s1
+      splitInfo.sticky = (({ nextSticky, ...pub }) => pub)(held);   // turn-log 只落 index／mode／gain（開關開時多 s1），跟以前一樣
       const cut = cutFromMessageIndex(parsedMsgs.historyMsgIdx, held.index);
       splitInfo.cut = cut;
-      splitBlocks = splitPromptBlocks(parsedMsgs, cut, modelId);   // 內部會自檢「接回來一字不差」與份量門檻，不合就回 null
+      const cut1 = sysFirst && held.s1 != null ? cutFromMessageIndex(parsedMsgs.historyMsgIdx, held.s1) : null;
+      splitBlocks = splitPromptBlocks(parsedMsgs, cut, modelId, { sysInFirstTurn: sysFirst, cut1 });   // 內部會自檢「接回來一字不差」與份量門檻，不合就回 null
       if (splitBlocks) {
         splitInfo.applied = true;
-        splitInfo.stableChars = splitBlocks[0].text.length;
-        splitInfo.movingChars = splitBlocks[1].text.length;
-        splitInfo.stableTokensEst = estimateTokens(splitBlocks[0].text);
+        // 帶標記的塊＝穩定區（關閉時只有一塊、跟以前同值；開時可能是舊塊＋新增段兩塊）；最後一塊永遠是會動塊
+        const marked = splitBlocks.filter(b => b.cache_control);
+        const stableText = marked.map(b => b.text).join('');
+        splitInfo.stableChars = stableText.length;
+        splitInfo.movingChars = splitBlocks[splitBlocks.length - 1].text.length;
+        splitInfo.stableTokensEst = estimateTokens(stableText, modelId);
+        if (sysFirst) {
+          splitInfo.s1 = marked.length === 2 ? cut1 : null;   // 四塊才有 s1（三塊＝退化、或還沒累積到第一次跳）
+          splitInfo.s2 = cut;
+        }
+        // ④ 門檻對的是前綴（系統提示＋穩定塊）；跟門檻並排印的數字也要是前綴，不然看起來像放行了不夠格的塊
+        splitInfo.prefixTokensEst = estimateTokens(systemPrompt || '', modelId) + splitInfo.stableTokensEst;
         splitInfo.minTokens = minCacheTokensFor(modelId);
         console.log(`[${PLUGIN_ID}] 拆塊 #${requestCount + 1}：歷史 ${cut}/${parsedMsgs.historyTurns.length} 則進穩定塊` +
-                    `（${splitInfo.stableChars} 字元／約 ${splitInfo.stableTokensEst} token 貼 1h 標記，門檻 ${splitInfo.minTokens}），` +
+                    `（${splitInfo.stableChars} 字元／約 ${splitInfo.stableTokensEst} token 貼 1h 標記；到斷點為止約 ${splitInfo.prefixTokensEst} token 含系統提示，門檻 ${splitInfo.minTokens}），` +
                     `其餘 ${splitInfo.movingChars} 字元不貼` +
-                    `｜斷點 ${held.mode}${held.gain != null ? `（可多納 ${held.gain} 則）` : ''}`);
+                    `｜斷點 ${held.mode}${held.gain != null ? `（可多納 ${held.gain} 則）` : ''}` +
+                    (sysFirst ? `｜系統提示走第一則，快取點 ${splitInfo.s1 != null ? `2 個：第 ${splitInfo.s1}／${splitInfo.s2} 則` : `1 個：第 ${splitInfo.s2} 則`}` : ''));
       } else {
         // 理由要分得出「切不出來」與「切得出來但份量不夠」——這兩件在 cacheRead 上完全同形，
         // 而後者正是 26-08-27 那個 bug 的臉。不分流的話，修好了也看不出修好沒有。
         const turns = parsedMsgs.historyTurns || [];
         const stablePreview = cut > 0 && cut < turns.length ? `<history>\n${turns.slice(0, cut).join('\n')}\n` : '';
-        const est = estimateTokens(stablePreview);
+        // ④ 跟份量閘同一把尺：到斷點為止的整個前綴（系統提示＋穩定塊）
+        const sysEst = estimateTokens(systemPrompt || '', modelId);
+        const est = sysEst + estimateTokens(stablePreview, modelId);
         const min = minCacheTokensFor(modelId);
-        splitInfo.stableTokensEst = est;
+        splitInfo.stableTokensEst = est - sysEst;
+        splitInfo.prefixTokensEst = est;
         splitInfo.minTokens = min;
         // cut=0 的時候「切不出來」講了等於沒講——使用者需要知道的是**哪裡在變**，
         // 因為那個東西在他的設定裡、只有他關得掉（26-08-27 實案：一位使用者拿到
@@ -1685,7 +1978,7 @@ async function handleChatCompletions(req, res) {
         splitInfo.zone = (typeof div === 'number' && Number.isFinite(parsedMsgs.headerEnd))
           ? (div < parsedMsgs.headerEnd ? 'system' : 'chat') : null;
         splitInfo.reason = stablePreview && est < min
-          ? `穩定塊只有 ${stablePreview.length} 字元／約 ${est} token，低於 ${modelId || '(未指定模型)'} 的最小可快取長度 ${min}——貼了會被 API 靜默忽略，所以整發不拆`
+          ? `到斷點為止只有約 ${est} token（含系統提示；穩定塊 ${stablePreview.length} 字元），低於 ${modelId || '(未指定模型)'} 的最小可快取長度 ${min}——貼了會被 API 靜默忽略，所以整發不拆`
           : `切不出來（cut=${cut}，歷史 ${turns.length} 則）${變動位置}`;
         console.log(`[${PLUGIN_ID}] 拆塊 #${requestCount + 1}：這發不拆（${splitInfo.reason}）`);
       }
@@ -1696,11 +1989,15 @@ async function handleChatCompletions(req, res) {
     // 讀數沒跳時才分得出「沒貼標記」與「貼了沒作用」——這兩件在 cacheRead 上完全同形。
     traceTurns(messages, headerEnd, requestCount + 1, evaluated, splitInfo, comp);
 
+    // ③ 開關開：系統提示原樣當 prompt 那則 user 的 content[0]（不貼、不加標記）；有拆時 splitPromptBlocks 已經把它排在第一塊
     const buildPrompt = () => (
       splitBlocks ? makeSplitPrompt(splitBlocks, images)
-        : hasImages ? makeImagePrompt(prompt, images)
-          : prompt
+        : sysFirst ? makeSplitPrompt([{ type: 'text', text: systemPrompt }, { type: 'text', text: prompt || '(empty message)' }], images)
+          : hasImages ? makeImagePrompt(prompt, images)
+            : prompt
     );
+    // recordUsage 的材料，兩條路共用；reqNo／costUsd 要等收尾才知道，呼叫時再補
+    const ctxBase = { modelId, effort: configEffort, shape, imgCount: hasImages ? images.length : 0, splitInfo, evaluated, systemDrift, comp };
 
     // 讓位期間（await releaseCurrent）酒館若已斷線，這裡再擋一次——SDK 一發都別燒
     if (ticket.aborted) return;
@@ -1711,32 +2008,10 @@ async function handleChatCompletions(req, res) {
       try {
         let fullText = '';
         let thinkingText = '';
-        let costUsd = 0;
-      let resultUsage = null;      // result 訊息自帶的 usage（Messages API 形狀）
-      let resultModelUsage = null; // result 訊息自帶的 modelUsage（駝峰形狀）
+        let absorbed = null;     // result 訊息收取結果（costUsd／resultUsage／resultModelUsage）；沒收到 result 就是 null
         const blockTypes = [];   // 這輪模型產出的 block 型別序列（空回覆診斷用）
         const diag = {};         // result 的 subtype/num_turns/is_error 與 stop_reason
-        const q = queryFn({
-          prompt: buildPrompt(),
-          options: {
-            systemPrompt: systemPromptForSdk(systemPrompt),
-            tools: [],
-            // 省掉自動標題生成（26-08-01 實測發現）。
-            // SDK 型別原文：提供 title 就「skips automatic title generation」。
-            // 不給的話，每次請求 SDK 會另外叫一次 Haiku 去生標題——實測它吃 527 tokens 輸入，
-            // 比主模型那次（161）還多三倍，佔總成本約四成。而橋設了 persistSession: false，
-            // session 根本不留，那個標題從頭到尾沒有任何用途。
-            // 設 TCB_AUTO_TITLE=1 可退回舊行為（重新讓 SDK 自動生標題），供對帳。
-            title: process.env.TCB_AUTO_TITLE === '1' ? undefined : 'SillyTavern bridge',
-            maxTurns: 1,
-            model: modelId,
-            permissionMode: 'dontAsk',
-            persistSession: persistSessionOption(),
-            settingSources: [],
-            ...thinkingOption(),
-            ...effortOption(),
-          },
-        });
+        const q = queryFn({ prompt: buildPrompt(), options: buildQueryOptions(modelId, systemPrompt, { stream: false, sysInFirstTurn: sysFirst }) });
         ticket.q = q;
 
         for await (const msg of q) {
@@ -1750,64 +2025,21 @@ async function handleChatCompletions(req, res) {
             }
             if (msg.message?.stop_reason) diag.stop_reason = msg.message.stop_reason;
           } else if (msg.type === 'result') {
-            // 欄位名相容：SDK 型別寫的是 total_cost_usd，舊版是 cost_usd。
-            // 只讀 cost_usd 會讓成本永遠是 0——而 costUsd===0 正是「模型沒被叫起來」
-            // 的診斷指紋之一，讀錯欄位會讓那條判準對所有空回覆誤診（26-08-01 實測抓到）。
-            costUsd = Number(msg.total_cost_usd ?? msg.cost_usd) || 0;
-            // usage 直接從 result 訊息拿——不必事後呼叫 API（那時 transport 已關，
-            // 會拿到 'ProcessTransport is not ready for writing'）。
-            resultUsage = msg.usage || null;
-            resultModelUsage = msg.modelUsage || null;
-            diag.costUsd = costUsd;   // 「零成本」是「模型根本沒被叫起來」的指紋之一
-            diag.subtype = msg.subtype;
-            diag.num_turns = msg.num_turns;
-            diag.is_error = msg.is_error;
-            // result 自己帶的文字（26-08-03 加，外部使用者回報後補）：額度用盡時 SDK
-            // **不拋例外**、照樣回一個 result，指紋跟憑證失效一模一樣——唯一能分辨的
-            // 線索就在這段文字裡。沒有它，兩種病因在畫面上完全同形。
-            if (typeof msg.result === 'string' && msg.result.trim()) diag.resultText = msg.result.slice(0, 300);
-            dumpResultOnError(requestCount + 1, msg);   // 出錯才印，正常路徑零噪音
+            absorbed = absorbResult(msg, diag, requestCount + 1);
             break; // 串流輸入模式不會自己收尾（SDK 等下一則輸入），拿到 result 就走
           }
         }
 
-        let usage;
-        // 優先用 result 訊息自帶的（不必事後呼叫 API，也沒有 transport 時機問題）；
-      // 都沒有才退回主動查詢，並把原因記下來
-      usage = (resultUsage || resultModelUsage)
-        ? { usage: resultUsage, modelUsage: resultModelUsage }
-        : await readUsage(q);
-
+        const usage = await resolveUsage(absorbed, q);
+        const costUsd = absorbed ? absorbed.costUsd : 0;
         requestCount++; counted = true;
         totalCostUsd += costUsd;
 
         // 快取讀數（26-08-01 加）。省額度的關鍵在快取有沒有命中，但這個數字
         // 原本拿到了卻沒印也沒傳——診斷不了就只能憑感覺猜「是不是有省到」。
-        //
-        // **刻意不寫死欄位名**：usage_EXPERIMENTAL() 是實驗性 API，欄位名可能
-        // 跟 Messages API 不同、也可能包一層。寫死名字的後果不是報錯，是印出
-        // undefined 然後看起來像「沒有快取」——拿著含有答案的資料說查不到。
-        // 記帳走共用的 recordUsage（串流那條也呼叫同一支，避免只改一半）
-        const { cacheFields, cacheRead, hitPct, inTok, outTok } = recordUsage(usage, {
-          reqNo: requestCount, mode: 'json', modelId, effort: configEffort,
-          shape, imgCount: hasImages ? images.length : 0, costUsd,
-          // 26-09-02（審核 A4）：跟串流那條同款——帳上要看得出這發被打斷（console 後綴＋cache-log 的 aborted）
-          aborted: ticket.aborted, suffix: ticket.aborted ? ' (讓位/斷線)' : '',
-          splitApplied: splitInfo.applied,
-          splitReason: splitInfo.reason,
-          splitDivergence: splitInfo.divergence ?? null,
-          splitZone: splitInfo.zone ?? null,
-          // 改寫診斷落檔（26-08-29）：差異片段預設就落，完整前後兩版要開 TCB_TURN_TRACE=1。
-          // 橋是唯一看得到實際送出內容的位置——外部工具攔不到 payload 的時候，這裡是唯一的證據源。
-          shiftKind: evaluated?.shift?.kind ?? null,
-          shiftDropped: evaluated?.shift?.dropped ?? null,
-          rewriteDiff: evaluated?.rewriteDiff ?? null,
-          rewriteFull: evaluated?.rewriteFull ?? null,
-          systemDrift: systemDrift.changed,
-          sysHash: systemDrift.hash,
-          sysRecurring: systemDrift.recurring,
-          comp: comp.summary,   // 26-09-02 組成表彙總（CX-260902-01）
-        });
+        // 記帳走共用的 recordUsage、ctx 走共用的 usageCtx（串流那條也呼叫同兩支，結構上不可能只改一半）
+        const { cacheFields, cacheRead, hitPct, inTok, outTok } = recordUsage(usage, usageCtx(
+          { ...ctxBase, reqNo: requestCount, costUsd }, { mode: 'json', aborted: ticket.aborted }));
 
         // 空回覆的黑盒子（26-07-27 外部使用者案）：bridge 原本只記請求不記回應，
         // 模型吐出一片空白時完全沒有線索，使用者只看得到「送出去、回來是空的」。
@@ -1882,29 +2114,10 @@ async function handleChatCompletions(req, res) {
     try {
       // 26-09-02（審核 A2）：queryFn 呼叫搬進 try。以前在 try 外——SSE 標頭已送出後它若同步拋錯，
       // 會跳到外層 catch，而外層只在 !headersSent 才回應：連線懸掛到酒館超時、終端機一個字都沒有。
-      const q = queryFn({
-        prompt: buildPrompt(),
-        options: {
-          systemPrompt: systemPromptForSdk(systemPrompt),
-          tools: [],
-          // 省掉自動標題生成——見非串流那處的完整說明。
-          // （這條是酒館實際會走的路徑；上次只改非串流那份，等於改了沒用。）
-          title: process.env.TCB_AUTO_TITLE === '1' ? undefined : 'SillyTavern bridge',
-          maxTurns: 1,
-          model: modelId,
-          permissionMode: 'dontAsk',
-          persistSession: persistSessionOption(),
-          includePartialMessages: true,
-          settingSources: [],
-          ...thinkingOption(),
-          ...effortOption(),
-        },
-      });
+      const q = queryFn({ prompt: buildPrompt(), options: buildQueryOptions(modelId, systemPrompt, { stream: true, sysInFirstTurn: sysFirst }) });
       ticket.q = q;
 
-      let costUsd = 0;
-      let resultUsage = null;      // result 訊息自帶的 usage（Messages API 形狀）
-      let resultModelUsage = null; // result 訊息自帶的 modelUsage（駝峰形狀）
+      let absorbed = null;     // result 訊息收取結果；沒收到 result 就是 null
       let sentText = false;    // 這輪有沒有真的送出過文字（空回覆診斷用）
       const blockTypes = [];
       const diag = {};
@@ -1928,54 +2141,17 @@ async function handleChatCompletions(req, res) {
             if (!ticket.aborted) res.write(`data: ${JSON.stringify(thinkChunk)}\n\n`);
           }
         } else if (msg.type === 'result') {
-          // 欄位名相容：SDK 型別寫的是 total_cost_usd，舊版是 cost_usd。
-          // 只讀 cost_usd 會讓成本永遠是 0——而 costUsd===0 正是「模型沒被叫起來」
-          // 的診斷指紋之一，讀錯欄位會讓那條判準對所有空回覆誤診（26-08-01 實測抓到）。
-          costUsd = Number(msg.total_cost_usd ?? msg.cost_usd) || 0;
-          // usage 直接從 result 訊息拿——不必事後呼叫 API（那時 transport 已關，
-          // 會拿到 'ProcessTransport is not ready for writing'）。
-          resultUsage = msg.usage || null;
-          resultModelUsage = msg.modelUsage || null;
-          diag.costUsd = costUsd;   // 「零成本」是「模型根本沒被叫起來」的指紋之一
-          diag.subtype = msg.subtype;
-          diag.num_turns = msg.num_turns;
-          diag.is_error = msg.is_error;
-          // 同上（串流路徑）——兩條路徑都要帶，只改一份等於真實情境永遠拿不到線索
-          if (typeof msg.result === 'string' && msg.result.trim()) diag.resultText = msg.result.slice(0, 300);
-          dumpResultOnError(requestCount + 1, msg);   // 出錯才印，正常路徑零噪音
+          absorbed = absorbResult(msg, diag, requestCount + 1);
           break; // 串流輸入模式不會自己收尾，拿到 result 就走
         }
       }
 
-      let usage;
-      // 優先用 result 訊息自帶的（不必事後呼叫 API，也沒有 transport 時機問題）；
-      // 都沒有才退回主動查詢，並把原因記下來
-      usage = (resultUsage || resultModelUsage)
-        ? { usage: resultUsage, modelUsage: resultModelUsage }
-        : await readUsage(q);
-
+      const usage = await resolveUsage(absorbed, q);
+      const costUsd = absorbed ? absorbed.costUsd : 0;
       requestCount++; counted = true;
       totalCostUsd += costUsd;
-      // 串流路徑（酒館的預設路徑）——記帳跟非串流走同一支 recordUsage
-      recordUsage(usage, {
-        reqNo: requestCount, mode: 'stream', modelId, effort: configEffort,
-        shape, imgCount: hasImages ? images.length : 0, costUsd,
-        splitApplied: splitInfo.applied,
-        splitReason: splitInfo.reason,
-          splitDivergence: splitInfo.divergence ?? null,
-          splitZone: splitInfo.zone ?? null,
-          // 改寫診斷落檔（26-08-29）：差異片段預設就落，完整前後兩版要開 TCB_TURN_TRACE=1。
-          // 橋是唯一看得到實際送出內容的位置——外部工具攔不到 payload 的時候，這裡是唯一的證據源。
-          shiftKind: evaluated?.shift?.kind ?? null,
-          shiftDropped: evaluated?.shift?.dropped ?? null,
-          rewriteDiff: evaluated?.rewriteDiff ?? null,
-          rewriteFull: evaluated?.rewriteFull ?? null,
-          systemDrift: systemDrift.changed,   // 26-08-27：這條（串流）原本漏了，面板因此對使用者說「還沒記到原因」
-          sysHash: systemDrift.hash,
-          sysRecurring: systemDrift.recurring,
-          comp: comp.summary,   // 26-09-02 組成表彙總（CX-260902-01）——兩條路都要餵，parity 測試盯著
-        aborted: ticket.aborted, suffix: ticket.aborted ? ' (讓位/斷線)' : '',
-      });
+      // 串流路徑（酒館的預設路徑）——記帳跟非串流走同一支 recordUsage、同一支 usageCtx
+      recordUsage(usage, usageCtx({ ...ctxBase, reqNo: requestCount, costUsd }, { mode: 'stream', aborted: ticket.aborted }));
 
       // 整輪一個字都沒送出＝空回覆。印黑盒子，並補一則通知取代空白畫面（26-07-27 外部使用者案）。
       // 被讓位／斷線的不算空回覆——那是被打斷，不是模型沒話講。
@@ -2231,4 +2407,6 @@ async function exit() {
 function _setQueryFn(fn) { queryFn = fn; }
 // traceTurns 一併 export：測試要驗的是**本體**，不是複製一份邏輯去測
 // （複製品測過≠本體會動，26-08-01 只改非串流那份的同族教訓）
-export { info, init, exit, parseMessages, thinkingOption, handleChatCompletions, _setQueryFn, traceTurns, splitPromptBlocks, makeSplitPrompt, splitEnabled, cacheSummary };
+// applyConfig／recordUsage 也 export（26-09-02 wave2-ε）：turn-trace 測 /config 的 trace 欄、cache-stats 測 recordUsage → cacheRoi 的價目接線——測本尊，不抄副本。
+// sysInFirstTurnEnabled（26-09-02 第二波 b ③）：split-toggle 測 /config 的 sysInFirstTurn 欄要驗本尊
+export { info, init, exit, parseMessages, thinkingOption, handleChatCompletions, _setQueryFn, traceTurns, splitPromptBlocks, makeSplitPrompt, splitEnabled, sysInFirstTurnEnabled, cacheSummary, applyConfig, recordUsage };

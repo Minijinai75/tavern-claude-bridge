@@ -2,7 +2,7 @@ const PLUGIN_ID = 'tavern-claude-bridge';
 const API_BASE = `/api/plugins/${PLUGIN_ID}`;
 const UI_PREFIX = 'tcb';
 const SETTINGS_KEY = 'tavern_claude_bridge';
-const LOCAL_VERSION = '1.8.8';
+const LOCAL_VERSION = '1.9.0';
 const GITHUB_RELEASE_API = 'https://api.github.com/repos/Minijinai75/tavern-claude-bridge/releases/latest';
 let updateCache;
 
@@ -14,6 +14,12 @@ const DEFAULT_SETTINGS = {
   // 拆塊省快取。預設開（26-08-03 起）——真實流量實測一則 $2.3459 → $0.7149。
   // 後端也預設開，所以沒裝這個前端面板的人一樣受益；這格只是讓使用者關得掉。
   cacheSplit: true,
+  // 診斷模式（26-09-02 第二波）。預設關——開著時後端會把每則送出內容的開頭 30 字寫進本機 turn-log.jsonl
+  // （平常那份只記雜湊不記原文），用來對照「是哪一則害快取失效」。看完就該關，所以預設不勾。
+  turnTrace: false,
+  // 省更多快取＝系統提示走對話第一則（26-09-02 第二波 b ③，試驗中）。預設關——關的時候一切跟現在一樣。
+  // 開了會多一個快取點（長對話省更多），代價是角色卡從 system 角色變 user 角色、語氣可能微妙地變，所以由使用者自己選。
+  sysInFirstTurn: false,
 };
 
 function getCtx() {
@@ -116,7 +122,7 @@ function buildPanel() {
             <input type="checkbox" id="${UI_PREFIX}-split">
             <span>拆塊省快取（建議開著）</span>
           </label>
-          <small id="${UI_PREFIX}-split-note">把對話裡「已經不會再變」的那一大段獨立標記起來快取，下一則就不用整包重算。實測一則從 $2.35 降到 $0.71。改設定、切換角色卡都會重建一次；世界書分兩種：關鍵字觸發的條目每次開關都會重建，常駐條目改內容才重建一次——這些都是正常的。覺得回覆怪怪的就先關掉，橋會退回原本的送法。</small>
+          <small id="${UI_PREFIX}-split-note">快取＝讓 Claude 記住上一則已經讀過的東西，下一則只重算新的部分、少付錢。打勾後，橋會把對話裡「已經不會再變」的那一大段單獨圈起來記住，下一則就不用整包重算。實測一則從 $2.35 降到 $0.71。改設定、切換角色卡都會重建一次；世界書分兩種：關鍵字觸發的條目每次開關都會重建，常駐條目改內容才重建一次——這些都是正常的。覺得回覆怪怪的就先關掉，橋會退回原本的送法。</small>
         </div>
         <div class="${UI_PREFIX}-option">
           <label class="checkbox_label">
@@ -124,6 +130,22 @@ function buildPanel() {
             <span>使用 Claude 原生思考摘要</span>
           </label>
           <small>預設關閉。你的預設如果自己會要求角色輸出思考（例如正文開頭的 <code>&lt;thinking&gt;</code> 區塊），請保持關閉——兩者會搶同一條通道，開著會讓思考變成中英混雜、偶爾整輪空白回覆。用素卡、想看 Claude 自己的推理摘要再打開。</small>
+        </div>
+        <div class="${UI_PREFIX}-option">
+          <label class="checkbox_label">
+            <input type="checkbox" id="${UI_PREFIX}-sysfirst">
+            <span>省更多快取（試驗中，預設關）</span>
+          </label>
+          <div class="${UI_PREFIX}-cache-warn" id="${UI_PREFIX}-sysfirst-warn" hidden></div>
+          <small id="${UI_PREFIX}-sysfirst-note">打勾後，角色卡跟系統提示會改放進對話的第一則一起送出。這樣橋可以多釘一個快取點，長對話省下來的錢會明顯多一截。代價：模型看角色卡的方式可能有一點不一樣，語氣可能微妙地變。想試就開、覺得怪就關，隨時可以切回來。</small>
+        </div>
+        <div class="${UI_PREFIX}-option">
+          <label class="checkbox_label">
+            <input type="checkbox" id="${UI_PREFIX}-trace">
+            <span>診斷模式（平常不用開）</span>
+          </label>
+          <div class="${UI_PREFIX}-cache-warn" id="${UI_PREFIX}-trace-warn" hidden></div>
+          <small id="${UI_PREFIX}-trace-note">打勾之後，你每送出一則，橋就把那一則開頭的 30 個字記進你自己電腦裡的 <code>turn-log.jsonl</code>（在 SillyTavern 的 plugins/tavern-claude-bridge 資料夾），用來對照「到底是哪一則害快取失效」。只會存在你的電腦，不會傳給任何人。查完記得關掉，免得一直累積。</small>
         </div>
         <div class="${UI_PREFIX}-actions">
           <button id="${UI_PREFIX}-refresh" class="menu_button" type="button">
@@ -211,10 +233,38 @@ function buildPanel() {
     });
   }
 
+  // 診斷模式：走法跟拆塊那格一模一樣（存設定 → 整份推給 /config）。
+  // 後端認不認得 trace 欄，由 syncConfig 拿回應驗、在這格底下叫（見 顯示診斷欄支援狀態）。
+  const traceEl = drawer.querySelector(`#${UI_PREFIX}-trace`);
+  if (traceEl) {
+    traceEl.checked = !!settings.turnTrace;
+    traceEl.addEventListener('change', () => {
+      settings.turnTrace = traceEl.checked;
+      getCtx()?.saveSettingsDebounced?.();
+      syncConfig();
+    });
+  }
+
+  // 省更多快取（系統提示走對話第一則，26-09-02 第二波 b ③）：走法跟診斷模式那格一模一樣。
+  // 後端認不認得 sysInFirstTurn 欄，由 syncConfig 拿回應驗、在這格底下叫（見 顯示多斷點欄支援狀態）。
+  const sysFirstEl = drawer.querySelector(`#${UI_PREFIX}-sysfirst`);
+  if (sysFirstEl) {
+    sysFirstEl.checked = !!settings.sysInFirstTurn;
+    sysFirstEl.addEventListener('change', () => {
+      settings.sysInFirstTurn = sysFirstEl.checked;
+      getCtx()?.saveSettingsDebounced?.();
+      syncConfig();
+    });
+  }
+
   // 快取效果數據卡。設計約束：這塊會被使用者截圖或複製出來回報，
   // 所以每個數字都要自己解釋，而且要分清楚哪些是實測（花費、token 數）、
   // 哪些是換算（幾倍）——不分的話，回報回來的數字沒有人分得出哪個能當證據。
   const 千分位 = n => (n || 0).toLocaleString('en-US');
+  // 「省更多快取」開著且真的拆到時，後端會給兩個快取點座標（lastSplitS1／lastSplitS2）；沒給就整段不印（關閉／舊版橋）
+  const 快取點座標 = c => (typeof c.lastSplitS2 === 'number'
+    ? (typeof c.lastSplitS1 === 'number' ? `｜快取點 2 個：第 ${c.lastSplitS1}／${c.lastSplitS2} 則` : `｜快取點 1 個：第 ${c.lastSplitS2} 則`)
+    : '');
 
   // 系統提示漂移的說法，按後端分型（26-09-02 審核 C9）：
   //   lastSystemRecurring === true  → 有東西時有時無（關鍵字觸發條目那型）
@@ -229,10 +279,11 @@ function buildPanel() {
         + '系統提示就跟著變。把常用的那幾條改成常駐、或把觸發條件收窄，變動就會少。';
     }
     if (c.lastSystemRecurring === false) {
-      return 開頭 + '形狀是「每則都是新值」：多半是時間戳、隨機數、每則重算的變數這類巨集。'
+      return 開頭 + '形狀是「每則都是新值」：多半是時間戳（每則自動帶進去的現在時間）、隨機數，'
+        + '這類每次都會自動換值的巨集（{{time}} 那種雙大括號的東西）。'
         + '找出系統提示裡會跟著時間或亂數變的那一段，拿掉或固定住。';
     }
-    return 開頭 + '常見來源：世界書的關鍵字觸發條目（綠燈）、每則重算的注入、時間戳。';
+    return 開頭 + '常見來源：世界書的關鍵字觸發條目（綠燈）、擴充或腳本每則重新插進來的內容、時間戳（每則自動帶進去的現在時間）。';
   };
   const 漂移短句 = (c) => c.lastSystemRecurring === true ? '有東西時有時無（關鍵字觸發條目那型）'
     : c.lastSystemRecurring === false ? '每則都是新值（時間戳那型）'
@@ -254,6 +305,7 @@ function buildPanel() {
     // 改成單則對照：實測時大家就是拿「$2.48 → $0.68」這樣看懂的，那就照那樣印。
     // token 數與倍數沒有刪掉，收進下面的摺疊區——它們是回報用的證據，不是給人讀的第一句。
     const 元 = n => `$${(n || 0).toFixed(2)}`;
+    const 額度 = n => Number.isInteger(n) ? String(n) : n.toFixed(1);
     const 標題 = document.createElement('div');
     標題.className = `${UI_PREFIX}-cache-headline`;
 
@@ -274,6 +326,13 @@ function buildPanel() {
     }
 
     cacheEl.append(`\n玩了 ${c.requests} 則，總共 ${元(c.costUsd)}（重開 SillyTavern 會歸零）`);
+
+    // 5 小時額度（26-09-02 第二波）：後端從 SDK 撈到就給 lastQuota5hPct（數字）；
+    // 沒撈到是 null、舊版橋沒這格是 undefined——兩種都**整行不出現**，不印「額度：不明」湊數。
+    // 放第一層不收摺疊：額度見底是玩到一半突然斷掉的那種事，得在第一眼就看到。
+    if (typeof c.lastQuota5hPct === 'number' && Number.isFinite(c.lastQuota5hPct)) {
+      cacheEl.append(`\n這一則之後，5 小時額度用了 ${額度(c.lastQuota5hPct)}%（Claude 訂閱每 5 小時一輪的額度，用滿要等它重置）`);
+    }
 
     // 拆塊開著卻沒生效——**放第一層，不收摺疊**（26-08-27，v1.7.0）。
     // 這次的 bug 活了很久不是因為難查，是因為它安靜：面板照樣寫「拆塊：開著」，
@@ -346,8 +405,9 @@ function buildPanel() {
     內文.className = `${UI_PREFIX}-cache-note`;
     內文.textContent = [
       `拆塊：${b.split ? '開著' : '關著'}${b.splitLocked ? '（被啟動參數鎖住）' : ''}`
-        + `｜${c.requests} 則裡有 ${c.splitApplied} 則拆到塊`,
-      `輸入 token：讀到快取 ${千分位(c.cacheRead)}／新建快取 ${千分位(c.cacheWrite)}／未快取 ${千分位(c.input)}`,
+        + `｜${c.requests} 則裡有 ${c.splitApplied} 則真的有拆`
+        + 快取點座標(c),
+      `輸入 token（計費用的字數單位）：讀到快取 ${千分位(c.cacheRead)}／新建快取 ${千分位(c.cacheWrite)}／未快取 ${千分位(c.input)}`,
       // 26-09-02 組成表（CX-260902-01）：這一發送了什麼——系統區／對話／注入各多少、跟上一發比幾則變幾則移位。
       // 字串由後端組（cacheSummary.lastCompLine），這裡只印，不另算；前面補一句白話（26-09-02 審核 C12c）。
       c.lastCompLine
@@ -377,8 +437,11 @@ function buildPanel() {
           ? `這一則 $${(c.lastCostUsd || 0).toFixed(4)}，上一則 $${(c.prevCostUsd || 0).toFixed(4)} → 省了 ${c.savedPct}%`
           : `這一則 $${(c.lastCostUsd || 0).toFixed(4)}，上一則 $${(c.prevCostUsd || 0).toFixed(4)}（快取正在建立或剛重建）`,
       `玩了 ${c.requests} 則，總共 $${(c.costUsd || 0).toFixed(4)}`,
+      typeof c.lastQuota5hPct === 'number' && Number.isFinite(c.lastQuota5hPct)
+        ? `這一則之後，5 小時額度用了 ${額度(c.lastQuota5hPct)}%` : '',
       `拆塊：${b.split ? '開' : '關'}${b.splitLocked ? '（被啟動參數鎖住）' : ''}`
-        + `｜${c.requests} 則裡有 ${c.splitApplied} 則拆到塊`,
+        + `｜${c.requests} 則裡有 ${c.splitApplied} 則真的有拆`
+        + 快取點座標(c),
       `讀快取 ${c.cacheRead}／新建快取 ${c.cacheWrite}／未快取 ${c.input} tokens`,
       倍 ? `累計換算 ${倍} 倍（含開頭建立費，剛開始會小於 1）` : '累計換算：資料不足',
       // 診斷四行（26-09-02 審核 C10c）：按鈕說「回報給我們的時候用這個」，最需要回報的診斷以前全不在剪貼簿裡。
@@ -472,7 +535,7 @@ function buildPanel() {
       splitEl.disabled = true;
       if (splitNoteEl) {
         splitNoteEl.textContent =
-          '這扇 SillyTavern 是用 TCB_SPLIT=0 啟動的（逃生門），拆塊被鎖住、面板改不動。'
+          '這次的 SillyTavern 是帶著 TCB_SPLIT=0 這個啟動參數開的（出問題時用的逃生門），拆塊被鎖住、面板改不動。'
           + '要放回來就用平常的方式重開 SillyTavern。';
       }
     }
@@ -522,11 +585,59 @@ async function syncConfig() {
     const res = await fetch(`${API_BASE}/config`, {
       method: 'POST',
       headers: getHeaders(),
-      body: JSON.stringify({ effort, thinking: !!settings.sdkThinking, split: !!settings.cacheSplit }),
+      body: JSON.stringify({
+        effort,
+        thinking: !!settings.sdkThinking,
+        split: !!settings.cacheSplit,
+        trace: !!settings.turnTrace,
+        sysInFirstTurn: !!settings.sysInFirstTurn,
+      }),
     });
-    if (!res.ok) console.warn(`[${PLUGIN_ID}] 設定同步失敗：HTTP ${res.status}`);
+    if (!res.ok) { console.warn(`[${PLUGIN_ID}] 設定同步失敗：HTTP ${res.status}`); return null; }
+    // 後端回的是整份現況（currentConfig）。拿它驗診斷欄有沒有被認得——舊版橋會把 trace 靜靜忽略。
+    const cfg = await res.json().catch(() => null);
+    顯示診斷欄支援狀態(cfg);
+    顯示多斷點欄支援狀態(cfg);
+    return cfg;
   } catch (err) {
     console.warn(`[${PLUGIN_ID}] 設定同步失敗：`, err);
+    return null;
+  }
+}
+
+// 診斷模式那格要靠後端 /config 回 trace 欄才算真的開了（26-09-02 第二波）。
+// 前端更新了、橋的本體沒換時，勾選框打勾、檔案卻沒在寫——又是一次「失敗長得跟成功一樣」，
+// 而且這次連錯誤訊息都沒有。所以每次同步都拿回應驗：使用者想開、後端卻沒回這欄，就在那格底下叫；
+// 措辭跟上面「前端／橋版本不同」的提示同款（同一個病：更新只做了一半）。
+function 顯示診斷欄支援狀態(cfg) {
+  const warn = document.getElementById(`${UI_PREFIX}-trace-warn`);
+  const box = document.getElementById(`${UI_PREFIX}-trace`);
+  if (!warn || !box) return;
+  const 想開 = !!box.checked;
+  const 後端認得 = !!cfg && typeof cfg === 'object' && typeof cfg.trace === 'boolean';
+  if (想開 && !後端認得) {
+    warn.textContent = '⚠️ 橋的本體版本太舊，還不認得診斷模式——這個勾現在沒有作用。'
+      + '請重跑 install.ps1、重開 SillyTavern，再回來勾一次。';
+    warn.hidden = false;
+  } else {
+    warn.hidden = true;
+  }
+}
+
+// 省更多快取那格同款（26-09-02 第二波 b ③）：使用者想開、後端 /config 卻沒回 sysInFirstTurn 欄＝橋的本體還是舊版，
+// 勾了沒作用——在那格底下叫，措辭跟診斷模式那格一樣（同一個病：更新只做了一半）。
+function 顯示多斷點欄支援狀態(cfg) {
+  const warn = document.getElementById(`${UI_PREFIX}-sysfirst-warn`);
+  const box = document.getElementById(`${UI_PREFIX}-sysfirst`);
+  if (!warn || !box) return;
+  const 想開 = !!box.checked;
+  const 後端認得 = !!cfg && typeof cfg === 'object' && typeof cfg.sysInFirstTurn === 'boolean';
+  if (想開 && !後端認得) {
+    warn.textContent = '⚠️ 橋的本體版本太舊，還不認得「省更多快取」——這個勾現在沒有作用。'
+      + '請重跑 install.ps1、重開 SillyTavern，再回來勾一次。';
+    warn.hidden = false;
+  } else {
+    warn.hidden = true;
   }
 }
 
