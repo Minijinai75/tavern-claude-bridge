@@ -325,6 +325,7 @@ const MODELS = [
   { id: 'claude-opus-4-6[1m]', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-opus-4-6', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-opus-4-8[1m]', object: 'model', owned_by: 'anthropic' },
+  { id: 'claude-fable-5-1', object: 'model', owned_by: 'anthropic' },   // 26-09-02 上線當天 Mini 點名加
   { id: 'claude-fable-5', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-sonnet-5', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-sonnet-4-6', object: 'model', owned_by: 'anthropic' },

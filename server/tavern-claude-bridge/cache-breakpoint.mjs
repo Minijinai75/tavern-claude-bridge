@@ -512,6 +512,7 @@ export function splitFlow(flow, cut) {
  */
 export const CACHE_MIN_TOKENS = {
   'claude-opus-5': 512,
+  'claude-fable-5-1': 512,   // 26-09-02：同 Fable 5 家族，未另查到不同數字
   'claude-fable-5': 512,
   'claude-mythos-5': 512,
   'claude-opus-4-8': 1024,
