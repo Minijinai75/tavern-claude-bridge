@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 // 拆塊斷點掃描器（26-08-02，CX-260802-03）：只做「斷點該落在哪一則」的計算，
 // 不碰渲染也不貼標記——分工線在那支的檔頭註解。目前只被量測模式用到。
-import { fingerprintTurns, decideBreakpoint, stickyBreakpoint, meetsCacheMinimum, estimateTokens, minCacheTokensFor, trackSystemPrompt, analyzeShift, cacheRoi, shortDiff, textOfTurn } from './cache-breakpoint.mjs';
+import { fingerprintTurns, decideBreakpoint, stickyBreakpoint, meetsCacheMinimum, estimateTokens, minCacheTokensFor, trackSystemPrompt, analyzeShift, cacheRoi, shortDiff, textOfTurn, composeTurns, composeLine } from './cache-breakpoint.mjs';
 
 // ESM 沒有 __dirname，自己算（快取讀數落檔要用——見 appendCacheLog）
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -159,6 +159,9 @@ function cacheSummary(t = cacheTally) {
     // 那筆新建的錢有沒有收回來（26-08-29）。面板只報「新建快取 50,000」的話，
     // 看起來像做了好事——實際上新建是一般輸入的兩倍價，隔幾小時才玩一則的人一次都收不回。
     cacheRoi: t === cacheTally ? cacheRoi(cacheHistory) : null,
+    // 26-09-02 組成表那一行（CX-260902-01）：後端組好字串，前端直接印——前端 import 不到後端函式，
+    // 兩邊各組一次遲早各說各話。
+    lastCompLine: t.lastComp ? composeLine(t.lastComp) : null,
   };
 }
 
@@ -760,6 +763,11 @@ function recordUsage(usage, ctx) {
     : '';
 
   console.log(`[${PLUGIN_ID}][${ctx.reqNo}] model=${ctx.modelId} effort=${ctx.effort} ${ctx.shape}${ctx.imgCount ? ` img=${ctx.imgCount}` : ''} cost=$${ctx.costUsd.toFixed(4)} total=$${totalCostUsd.toFixed(4)}${usage ? ` in=${inTok} out=${outTok}` : ' usage=n/a'}${cacheNote}${quotaNote}${ctx.suffix || ''}`);
+  // 26-09-02 組成表那一行（CX-260902-01）：每發印一行，面板也拿得到（cacheSummary.lastCompLine）
+  if (ctx.comp) {
+    cacheTally.lastComp = ctx.comp;
+    console.log(`[${PLUGIN_ID}] #${ctx.reqNo} ${composeLine(ctx.comp)}`);   // 前綴刻意不同於請求 log 那行——request-log 測試釘死那格只准一處
+  }
 
   // 同一份資料落檔一份——上面那行 console 在無視窗啟動的酒館裡沒有人接得到
   appendCacheLog({
@@ -783,6 +791,9 @@ function recordUsage(usage, ctx) {
     sysDrift: ctx.systemDrift ?? null,
     sysHash: ctx.sysHash ?? null,
     sysRecurring: ctx.sysRecurring ?? null,
+    // 26-09-02 組成表彙總（CX-260902-01）：系統區／對話／注入各多少則多少字元、跟上一發幾則變幾則移位。
+    // 只有數字不含內容。逐則明細在 turn-log.jsonl。
+    comp: ctx.comp ?? null,
     // 訂閱額度使用率——SDK 順便給的，比 token 數對訂閱制更有意義
     ...(flat.fiveHourPct != null ? { quota5hPct: flat.fiveHourPct } : {}),
     ...(flat.sevenDayPct != null ? { quota7dPct: flat.sevenDayPct } : {}),
@@ -1093,10 +1104,15 @@ export function conversationKey(systemPrompt) {
   return createHash('sha1').update(String(systemPrompt || '')).digest('hex').slice(0, 12);
 }
 
-function traceTurns(messages, headerEnd, reqNo, evaluated, splitInfo) {
-  if (process.env.TCB_TURN_TRACE !== '1') return;
+function traceTurns(messages, headerEnd, reqNo, evaluated, splitInfo, compIn) {
+  // 26-09-02（CX-260902-01）：**預設開**。原本要設 TCB_TURN_TRACE=1，使用者不會設環境變數，
+  // 於是「每一則是誰、變沒變」這份資料從來沒到過任何使用者手上。
+  // 現在逐則**結構**永遠落檔（role／kind／長度／同／移位／新，不含內容）；
+  // 只有「開頭 30 字」——唯一會碰到內容的欄位——與 console 那行留在診斷模式。
+  const trace = process.env.TCB_TURN_TRACE === '1';
   try {
     const { decision, prevFps, fps } = evaluated || evaluateBreakpoint(messages, headerEnd);
+    const comp = compIn || composeTurns(messages, headerEnd, prevFps, { fps });
     const entry = {
       t: new Date().toISOString(),
       n: reqNo,
@@ -1111,16 +1127,16 @@ function traceTurns(messages, headerEnd, reqNo, evaluated, splitInfo) {
       depthFromTail: decision.index ? messages.length - decision.index : null,
       source: decision.source,
       why: decision.why,
-      // 每則只留 role 與長度，不留內容（結構模式的紀律：看得出哪裡變了，看不到寫了什麼）
-      turns: messages.map((m, i) => ({
-        i,
-        role: m?.role || '?',
-        len: typeof m?.content === 'string' ? m.content.length : -1,
-        // 比的是 prevFps（上一發），**不是 prevTurnFps**——後者已經被 evaluateBreakpoint
-        // 更新成這一發的指紋了，拿它比等於自己跟自己比，changed 會全部是 false。
-        // （26-08-02：這個坑我在 evaluateBreakpoint 上面才寫過警告，然後在下面十行踩進去，
-        //   測試「被改寫那則有標 changed」當場抓到。註解擋不住，測試擋得住。）
+      comp: comp.summary,
+      // 每則：i/role/kind/len/vs/prevIndex/changed——結構，不含內容。
+      // vs 是指紋查表（same／moved／new），changed 是同位置比對；兩個都留——
+      // 前者給人讀（插入一則不會把後面全報成變），後者給舊工具讀。
+      // changed 比的是 prevFps（上一發），**不是 prevTurnFps**——後者已被 evaluateBreakpoint
+      // 更新成這一發的指紋了（26-08-02 的坑，測試擋著）。
+      turns: comp.turns.map((t, i) => ({
+        ...t,
         changed: prevFps ? (prevFps[i] !== fps[i]) : null,
+        ...(trace ? { head: contentHead(messages[i] && messages[i].content) } : {}),
       })),
     };
     const file = path.join(__dirname, 'turn-log.jsonl');
@@ -1131,8 +1147,10 @@ function traceTurns(messages, headerEnd, reqNo, evaluated, splitInfo) {
       }
     } catch {}
     fs.appendFileSync(file, JSON.stringify(entry) + '\n', 'utf8');
-    console.log(`[${PLUGIN_ID}] 斷點量測 #${reqNo}：${decision.source} 斷在第 ${decision.index}/${messages.length} 則` +
-                `${decision.divergence !== null ? `（第一個變動在 ${decision.divergence}）` : ''}`);
+    if (trace) {
+      console.log(`[${PLUGIN_ID}] 斷點量測 #${reqNo}：${decision.source} 斷在第 ${decision.index}/${messages.length} 則` +
+                  `${decision.divergence !== null ? `（第一個變動在 ${decision.divergence}）` : ''}`);
+    }
   } catch (e) {
     // 不靜默吞——靜默會讓「上線即失效」長得跟「正常運作」一樣（8/01 的課，同 tracePrefix）
     console.warn(`[${PLUGIN_ID}] 斷點量測失敗：${String((e && e.message) || e).slice(0, 120)}`);
@@ -1493,8 +1511,15 @@ async function handleChatCompletions(req, res) {
     const { systemPrompt, prompt, images, headerEnd } = parsedMsgs;
     // 斷點：量測模式與拆塊模式共用同一次計算（兩邊各算一次會讓第二次拿自己當基準，
     // 見 evaluateBreakpoint 的註解）。兩個開關都關著就完全不算，不付這個成本。
-    const bpNeeded = process.env.TCB_TURN_TRACE === '1' || splitEnabled();
-    const evaluated = bpNeeded ? evaluateBreakpoint(messages, headerEnd, conversationKey(systemPrompt)) : null;
+    // 26-09-02（CX-260902-01）：組成表**預設開**，每發都要有「上一發的指紋」可比，所以斷點評估
+    // 不再看開關——它本來就是純計算，基準只在請求成功後由 commitTurnBaseline 提交。
+    // 拆塊關著時 evaluated 照算但不用來切，只餵組成表與診斷。
+    const evaluated = evaluateBreakpoint(messages, headerEnd, conversationKey(systemPrompt));
+    // 組成表：每一則是 系統區／對話／注入、多長、跟上一發 同／移位／新。
+    // 彙總進 cache-log 與面板，逐則進 turn-log（traceTurns）。指紋沿用 evaluated 算好的，不重算。
+    // 為什麼要它：一位使用者的「擴充功能 7,074 token」在酒館面板只有總數、內建子項全是 0——
+    // 那七千來自第三方擴充的注入，只存在於送出的那一刻，檔案裡看不到，只有這裡看得到。
+    const comp = composeTurns(messages, headerEnd, evaluated.prevFps, { fps: evaluated.fps });
     // 前綴指紋：只在 TCB_PREFIX_TRACE=1 時動作，兩條路徑（串流／非串流）都在這之後分岔，
     // 所以放這裡一次涵蓋——8/01 只改非串流那份、真實情境一次都沒觸發，不再犯。
     tracePrefix(systemPrompt, prompt, requestCount + 1);
@@ -1627,7 +1652,7 @@ async function handleChatCompletions(req, res) {
     }
     // 落檔放這裡：要把「開關開了沒／有沒有真的拆／切在哪」寫進同一筆，
     // 讀數沒跳時才分得出「沒貼標記」與「貼了沒作用」——這兩件在 cacheRead 上完全同形。
-    traceTurns(messages, headerEnd, requestCount + 1, evaluated, splitInfo);
+    traceTurns(messages, headerEnd, requestCount + 1, evaluated, splitInfo, comp);
 
     const buildPrompt = () => (
       splitBlocks ? makeSplitPrompt(splitBlocks, images)
@@ -1732,6 +1757,7 @@ async function handleChatCompletions(req, res) {
           systemDrift: systemDrift.changed,
           sysHash: systemDrift.hash,
           sysRecurring: systemDrift.recurring,
+          comp: comp.summary,   // 26-09-02 組成表彙總（CX-260902-01）
         });
 
         // 空回覆的黑盒子（26-07-27 外部使用者案）：bridge 原本只記請求不記回應，
@@ -1890,6 +1916,7 @@ async function handleChatCompletions(req, res) {
           systemDrift: systemDrift.changed,   // 26-08-27：這條（串流）原本漏了，面板因此對使用者說「還沒記到原因」
           sysHash: systemDrift.hash,
           sysRecurring: systemDrift.recurring,
+          comp: comp.summary,   // 26-09-02 組成表彙總（CX-260902-01）——兩條路都要餵，parity 測試盯著
         aborted: ticket.aborted, suffix: ticket.aborted ? ' (讓位/斷線)' : '',
       });
 

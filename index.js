@@ -2,7 +2,7 @@ const PLUGIN_ID = 'tavern-claude-bridge';
 const API_BASE = `/api/plugins/${PLUGIN_ID}`;
 const UI_PREFIX = 'tcb';
 const SETTINGS_KEY = 'tavern_claude_bridge';
-const LOCAL_VERSION = '1.8.6';
+const LOCAL_VERSION = '1.8.7';
 const GITHUB_RELEASE_API = 'https://api.github.com/repos/Minijinai75/tavern-claude-bridge/releases/latest';
 let updateCache;
 
@@ -311,6 +311,9 @@ function buildPanel() {
       `拆塊：${b.split ? '開著' : '關著'}${b.splitLocked ? '（被啟動參數鎖住）' : ''}`
         + `｜${c.requests} 則裡有 ${c.splitApplied} 則拆到塊`,
       `輸入 token：讀到快取 ${千分位(c.cacheRead)}／新建快取 ${千分位(c.cacheWrite)}／未快取 ${千分位(c.input)}`,
+      // 26-09-02 組成表（CX-260902-01）：這一發送了什麼——系統區／對話／注入各多少、跟上一發比幾則變幾則移位。
+      // 字串由後端組（cacheSummary.lastCompLine），這裡只印，不另算。
+      c.lastCompLine || '',
       // 那筆「新建」的錢有沒有收回來（26-08-29）。只報數字的話，「新建快取 50,000」
       // 看起來像做了好事——實際上新建是一般輸入的兩倍價，隔幾小時才玩一則的人一次都收不回。
       快取划算嗎(c.cacheRoi),
