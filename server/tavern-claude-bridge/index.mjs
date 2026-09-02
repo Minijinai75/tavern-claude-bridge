@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { randomUUID, createHash } from 'node:crypto';   // createHash：前綴指紋用（26-08-02）
+import { randomUUID, createHash } from 'node:crypto';   // createHash：對話識別雜湊用（conversationKey）
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -156,6 +156,9 @@ function cacheSummary(t = cacheTally) {
     lastDivergence: t.lastDivergence ?? null,
     lastDivergenceZone: t.lastDivergenceZone ?? null,   // 'system' | 'chat' | null
     lastSystemDrift: t.lastSystemDrift ?? null,
+    // 26-09-02（審核 C9）：最近一次漂移是「落回看過的值」（true＝有東西時有時無，關鍵字條目那型）
+    // 還是「每次都是新值」（false＝時間戳那型）。沒資料回 null，前端不准拿 null 當 false 印。
+    lastSystemRecurring: t.lastSystemRecurring ?? null,
     // 那筆新建的錢有沒有收回來（26-08-29）。面板只報「新建快取 50,000」的話，
     // 看起來像做了好事——實際上新建是一般輸入的兩倍價，隔幾小時才玩一則的人一次都收不回。
     cacheRoi: t === cacheTally ? cacheRoi(cacheHistory) : null,
@@ -309,11 +312,22 @@ const MODELS = [
 
 // 酒館「傳送內嵌媒體」送的是 OpenAI 格式的 data URL，Claude 要的是 base64 三件組。
 // 只吃 data URL——外部網址一律不下載（bridge 不該替使用者去打別人的伺服器）。
+// 26-09-02（審核 A11）：丟棄要出聲、media_type 要驗。以前外部網址與非圖片 data URL 都靜默丟掉——
+// 模型完全不知道有圖、終端機零訊息；PDF／SVG 則原樣包成 image block 送出，API 拒收後走「執行錯誤」，
+// 使用者看不出是圖的格式。**只加警告，不往送出內容塞任何佔位字**（那是動送出內容，要另拍板）。
+const IMAGE_MEDIA_TYPES = /^image\/(jpeg|png|gif|webp)$/i;
 function toImageBlock(part) {
   const url = part && part.image_url && part.image_url.url;
   if (typeof url !== 'string') return null;
   const m = url.match(/^data:([^;,]+);base64,(.+)$/);
-  if (!m) return null;
+  if (!m) {
+    console.warn(`[${PLUGIN_ID}] 圖片略過：只吃 data URL（base64），外部網址不下載（${url.slice(0, 60)}${url.length > 60 ? '…' : ''}）`);
+    return null;
+  }
+  if (!IMAGE_MEDIA_TYPES.test(m[1])) {
+    console.warn(`[${PLUGIN_ID}] 圖片略過：media_type ${m[1]} 不在 API 支援名單（jpeg／png／gif／webp）`);
+    return null;
+  }
   return { type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } };
 }
 
@@ -604,52 +618,9 @@ async function readUsage(q) {
   return undefined;
 }
 
-// ── 前綴指紋（26-08-02 加，CX-260802-01 定位用）──────────────────────
-// 要解的問題：快取每輪整包重寫、一次都沒讀到（十發實測）。而 spike 證明
-// 「攤平送出不是問題，只要前面那段逐字不變就會命中」——所以一定有東西
-// 插在前面、每輪在變，但不知道是哪一段。
-//
-// 做法：把送出去的內容切段，每段只記 SHA256 前 8 碼。兩輪一比，
-// 從第幾段開始雜湊不同，那段就是兇手。
-//
-// **只記雜湊不記原文**——使用者的 RP 內容不落盤，這是紅線（同族：26-07-29
-// 密鑰偵察全程用遮罩與指紋比對，不讓值進畫面就是不讓它進雲端）。
-// 預設關（`TCB_PREFIX_TRACE=1` 才開），因為它每輪都要寫檔。
-// 每段字元數。4000 是第一輪的粗掃粒度（22 段，夠定位到「哪一區」）；
-// 要精確到「哪一句」就調小重測，例如 TCB_PREFIX_CHUNK=500。
-// 26-08-02 首輪實測：4000 粒度已定位到 S03（系統提示第 12000~16000 字元）。
-const PREFIX_CHUNK = Math.max(100, parseInt(process.env.TCB_PREFIX_CHUNK, 10) || 4000);
-const PREFIX_LOG_MAX_BYTES = 2 * 1024 * 1024;
-function tracePrefix(systemPrompt, prompt, reqNo) {
-  if (process.env.TCB_PREFIX_TRACE !== '1') return;
-  try {
-    const segs = [];
-    const cut = (label, text) => {
-      const s = typeof text === 'string' ? text : '';
-      for (let i = 0; i < s.length; i += PREFIX_CHUNK) {
-        const part = s.slice(i, i + PREFIX_CHUNK);
-        segs.push({
-          id: `${label}${String(Math.floor(i / PREFIX_CHUNK)).padStart(2, '0')}`,
-          len: part.length,
-          h: createHash('sha256').update(part).digest('hex').slice(0, 8),
-        });
-      }
-    };
-    cut('S', systemPrompt);   // 系統提示（角色卡＋預設前段）
-    cut('P', prompt);         // 對話流（攤平後那一大串）
-    const file = path.join(__dirname, 'prefix-log.jsonl');
-    try {
-      const st = fs.statSync(file);
-      if (st.size > PREFIX_LOG_MAX_BYTES) {
-        fs.writeFileSync(file, fs.readFileSync(file, 'utf8').split('\n').slice(-500).join('\n'), 'utf8');
-      }
-    } catch {}
-    fs.appendFileSync(file, JSON.stringify({ t: new Date().toISOString(), n: reqNo, segs }) + '\n', 'utf8');
-  } catch (e) {
-    // 不能靜默吞——靜默會讓「上線即失效」長得跟「正常運作」一模一樣（8/01 的課）
-    console.warn(`[${PLUGIN_ID}] 前綴指紋記錄失敗：${String((e && e.message) || e).slice(0, 120)}`);
-  }
-}
+// （26-08-02 的前綴切段雜湊工具——定位「哪一段每輪在變」用——已於 26-09-02 退役，審核 B7③、Mini 拍板 ⑩：
+//   一次性工具，turn-log 逐則指紋＋cache-log 的 sysHash 已覆蓋同一件事。它的紅線「只記雜湊不記原文」
+//   由 turn-log 的結構模式繼承。要考古看 git 歷史。）
 
 // 從 SDK 的 usage 回應撈出這次要的三組數字。
 // 結構（0.3.216 實測）：session.model_usage[<模型名>] 底下才是 inputTokens /
@@ -718,8 +689,11 @@ function recordUsage(usage, ctx) {
   const cacheOther = sumMatching(cacheFields, /^(?!.*(read|creat|write)).*$/i);
   const inTok = flat.input || usage?.input_tokens || 0;
   const outTok = flat.output || usage?.output_tokens || 0;
-  // 命中率分母＝這次真正處理的輸入量（未快取＋快取讀）
-  const inputTotal = inTok + cacheRead;
+  // 命中率分母＝這次送進去的全部輸入（未快取＋快取讀＋快取寫），跟 cacheSummary() 同一把尺。
+  // 26-09-02（審核 C2）：舊分母漏了 cacheWrite——26-09-01 n5 真實數字 read 7,815／write 23,037／in 3，
+  // 真命中率 25%，console 與 cache-log 卻印 hit=100%。「命中 100%」跟「額度在燒」同時成立，
+  // 看的人會去找別的兇手。兩處口徑不同就是儀器說謊。
+  const inputTotal = inTok + cacheRead + cacheWrite;
   const hitPct = inputTotal > 0 ? Math.round((cacheRead / inputTotal) * 100) : null;
 
   // 累計進面板要顯示的統計。只有真的拿到 usage 才記——拿不到就記 0 會把倍數稀釋，
@@ -736,6 +710,9 @@ function recordUsage(usage, ctx) {
     if (ctx.splitDivergence !== undefined) cacheTally.lastDivergence = ctx.splitDivergence;
     if (ctx.splitZone !== undefined) cacheTally.lastDivergenceZone = ctx.splitZone;
     if (ctx.systemDrift !== undefined) cacheTally.lastSystemDrift = ctx.systemDrift;
+    // 26-09-02（審核 C9）：recurring（來回切換 vs 每則新值）後端早就算了，面板卻拿不到——
+    // 前端只能印一句寫死的舊指認。把最近一次的布林暴露給 cacheSummary。
+    if (ctx.sysRecurring !== undefined) cacheTally.lastSystemRecurring = ctx.sysRecurring;
     cacheTally.input += inTok;
     cacheTally.cacheRead += cacheRead;
     cacheTally.cacheWrite += cacheWrite;
@@ -815,7 +792,10 @@ function recordUsage(usage, ctx) {
     ...(ctx.reqNo === 1 && usage ? { usageShape: Object.keys(collectCacheFields(usage)) } : {}),
   });
 
-  return { cacheFields, cacheRead, cacheWrite, hitPct };
+  // inTok／outTok 也回：非串流回酒館的 usage 三欄要用**同一份**攤平結果——
+  // 26-09-02（審核 A1）之前那裡讀的是 usage.input_tokens（舊的平坦形狀），永遠 undefined → 三欄恆 0，
+  // 而同一發的 console／cache-log 走 flattenUsage 是對的，兩邊各說各話。
+  return { cacheFields, cacheRead, cacheWrite, hitPct, inTok, outTok };
 }
 
 // 首次請求印一次 usage 的形狀（欄位名＋型別，不印值以外的東西）。
@@ -1036,6 +1016,12 @@ export function evaluateBreakpoint(messages, headerEnd, convKey) {
   if (convKey !== undefined && convKey !== prevTurnKey) {
     prevTurnFps = null;
     prevTurnKey = convKey;
+    // 26-09-02（審核 C5）：換對話時 sticky 斷點與雜湊歷史也要歸零。
+    // sticky 不清：新對話黏在舊對話的第 N 則上，held 期間少納一截進穩定塊，要再玩到 gain≥40 才跳。
+    // systemHashSeen 不清：A→B→A 切回來被判 recurring「來回切換」，其實只是換了聊天。
+    // systemHash **保留**——換對話後第一發報一次「系統提示變了」是真的，該報。
+    splitState.sticky = null;
+    splitState.systemHashSeen = [];
   }
   const decision = decideBreakpoint(messages, prevTurnFps, {
     headerEnd,
@@ -1107,8 +1093,10 @@ export function conversationKey(systemPrompt) {
 function traceTurns(messages, headerEnd, reqNo, evaluated, splitInfo, compIn) {
   // 26-09-02（CX-260902-01）：**預設開**。原本要設 TCB_TURN_TRACE=1，使用者不會設環境變數，
   // 於是「每一則是誰、變沒變」這份資料從來沒到過任何使用者手上。
-  // 現在逐則**結構**永遠落檔（role／kind／長度／同／移位／新，不含內容）；
-  // 只有「開頭 30 字」——唯一會碰到內容的欄位——與 console 那行留在診斷模式。
+  // 現在逐則**結構**永遠落檔（role／kind／長度／同／移位／新，不含內容）。
+  // 會碰到內容的兩格——每則的 head（開頭 30 字）、split.reason 裡變動點那則的開頭片段——
+  // 只在診斷模式落檔；預設模式的 split.reason 先把片段剝掉（stripContentHead）再落，console 那行也只在診斷模式。
+  // （cache-log 的 rewriteDiff——前後各 24 字＋前後文 36 字——是另一條線，預設就落，不歸這段管。）
   const trace = process.env.TCB_TURN_TRACE === '1';
   try {
     const { decision, prevFps, fps } = evaluated || evaluateBreakpoint(messages, headerEnd);
@@ -1120,7 +1108,12 @@ function traceTurns(messages, headerEnd, reqNo, evaluated, splitInfo, compIn) {
       headerEnd,
       // 拆塊實況：開關開了沒／有沒有真的拆／切在哪。沒有這格的話，
       // 「標記沒貼上去」與「貼了但沒作用」在 cacheRead 上完全同形，查不出來。
-      split: splitInfo || { enabled: splitEnabled(), applied: false, reason: '本次呼叫沒帶 splitInfo' },
+      // reason 在不拆時夾著 describeDivergentTurn() 的「、開頭：「…30 字…」」——那是內容。
+      // 預設模式落檔前剝掉、只留結構描述；診斷模式才原樣落（26-09-02 審核 C11a）。
+      // 只改落檔這份拷貝——cacheTally.lastSkipReason（面板用，本機即時看）照舊帶片段。
+      split: splitInfo
+        ? { ...splitInfo, reason: trace ? splitInfo.reason : stripContentHead(splitInfo.reason) }
+        : { enabled: splitEnabled(), applied: false, reason: '本次呼叫沒帶 splitInfo' },
       divergence: decision.divergence,
       breakpoint: decision.index,
       // 距尾第幾則——這是跟施工卡規格對話用的單位
@@ -1152,7 +1145,7 @@ function traceTurns(messages, headerEnd, reqNo, evaluated, splitInfo, compIn) {
                   `${decision.divergence !== null ? `（第一個變動在 ${decision.divergence}）` : ''}`);
     }
   } catch (e) {
-    // 不靜默吞——靜默會讓「上線即失效」長得跟「正常運作」一樣（8/01 的課，同 tracePrefix）
+    // 不靜默吞——靜默會讓「上線即失效」長得跟「正常運作」一樣（8/01 的課）
     console.warn(`[${PLUGIN_ID}] 斷點量測失敗：${String((e && e.message) || e).slice(0, 120)}`);
   }
 }
@@ -1285,7 +1278,7 @@ export function cutFromMessageIndex(historyMsgIdx, breakpointMsgIdx) {
  * 拆塊只切對話那一段，變動點在系統提示區時它完全無能為力——這句話不講白，
  * 使用者會以為調拆塊設定有用，然後白花一輪額度。
  *
- * 只讀 role 與長度，不碰內容——RP 內容不進 log（同族：tracePrefix 的隱私規則）。
+ * 只讀 role 與長度，不碰內容——RP 內容不進 log（同族：cache-log 只存雜湊不存原文的隱私規則）。
  */
 export function describeDivergentTurn(messages, divergence, headerEnd) {
   if (typeof divergence !== 'number' || !Number.isFinite(divergence)) return '';
@@ -1328,6 +1321,17 @@ export function describeDivergentTurn(messages, divergence, headerEnd) {
  *   ② 壓成單行——否則一則長訊息會把 log 撐爛
  *   ③ 只出現在使用者自己機器的終端機與面板，不上傳、不落遠端
  */
+/**
+ * 把 describeDivergentTurn 塞進 reason 的「、開頭：「…」」片段剝掉，只留結構描述。
+ * turn-log 預設模式不落內容（26-09-02 審核 C11a）——這句宣稱要成立，落檔前得真的剝。
+ * 片段固定長「、開頭：「<單行 ≤31 字>」——」（contentHead 已壓成單行），用後面的「——」當右界，
+ * 內容裡就算出現「」也剝得乾淨。
+ */
+function stripContentHead(text) {
+  if (typeof text !== 'string') return text;
+  return text.replace(/、開頭：「[\s\S]*?」(?=——)/g, '');
+}
+
 function contentHead(content, max = 30) {
   const raw = typeof content === 'string' ? content
     : Array.isArray(content) ? content.map(p => (p && typeof p.text === 'string') ? p.text : '').join('')
@@ -1422,19 +1426,24 @@ function readBody(req) {
   });
 }
 
+// 把 SDK 的錯誤翻成使用者能處置的一句話。**翻譯後面一律括號保留原文**——
+// 給錯處置比不給更糟（EMPTY_REASONS 那段的教訓）：翻錯了至少原文還在，人能自己查。
+// 26-09-02（審核 A7）收窄兩條正則：舊的 `not.?found` 把「model: xxx not found」翻成「找不到 CLI」，
+// 舊的 `log.?in` 把「Error logging request」翻成「未登入」——都是叫人去修一個不存在的病。
 function humanError(err) {
-  const msg = err.message || String(err);
-  if (/not.?authenticated|login|log.?in/i.test(msg)) {
-    return 'Claude Code 尚未登入。請在終端機執行 claude login 完成訂閱登入後重啟 SillyTavern。';
+  const msg = (err && err.message) || String(err);
+  const withRaw = text => `${text}（原始錯誤：${msg}）`;
+  if (/not.?(logged|authenticated)|please.?log.?in|unauthorized|401/i.test(msg)) {
+    return withRaw('Claude Code 尚未登入。請在終端機執行 claude login 完成訂閱登入後重啟 SillyTavern。');
   }
   if (/rate.?limit|too.?many|quota|exceeded/i.test(msg)) {
-    return '額度已達上限或請求太頻繁。稍後再試，或到 claude.ai Settings → Usage 查看額度。';
+    return withRaw('額度已達上限或請求太頻繁。稍後再試，或到 claude.ai Settings → Usage 查看額度。');
   }
   if (/overloaded|capacity/i.test(msg)) {
-    return 'Claude 伺服器忙碌中，稍後再試。';
+    return withRaw('Claude 伺服器忙碌中，稍後再試。');
   }
-  if (/ENOENT|not.?found|command.?not/i.test(msg)) {
-    return '找不到 Claude Code CLI。請確認已安裝 Claude Code（npm install -g @anthropic-ai/claude-code）並完成登入。';
+  if (/ENOENT|spawn|command.?not.?found/i.test(msg)) {
+    return withRaw('找不到 Claude Code CLI。請確認已安裝 Claude Code（npm install -g @anthropic-ai/claude-code）並完成登入。');
   }
   return msg;
 }
@@ -1451,11 +1460,31 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  // 新的一則進來＝玩家要這一則，前一則直接讓位（不再回 429 把人擋在門外）
-  await releaseCurrent('新請求進來');
-
+  // 票先開、斷線監聽先掛；**讓位與坐上位子都等驗證通過之後**（見下方 releaseCurrent 那段）。
+  // current = ticket 若在讓位之前就設，releaseCurrent 會把自己讓掉。
   const ticket = { q: null, aborted: false };
-  current = ticket;
+  let completionId = null;   // 兩條路徑與外層 catch 都要用，所以提到 try 外
+  let modelId = null;
+  // 連線還活著才寫——讓位時 res 還開著，要收尾；酒館自己斷線時 res 已關，寫了也沒人收。
+  const resAlive = () => !res.writableEnded && !res.destroyed;
+  // SSE 收尾三件套：finish chunk＋[DONE]＋end。正常、被讓位、拋錯三條路都走這支，不會再有哪條忘了收。
+  const endSse = (finishReason) => {
+    if (!resAlive()) return;
+    res.write(`data: ${JSON.stringify(makeChunk(completionId, modelId, {}, finishReason))}\n\n`);
+    res.write('data: [DONE]\n\n');
+    res.end();
+  };
+  // 26-09-02（審核 A3）：SDK 拋錯不准靜默——以前兩條路的 catch 只把 humanError 回給酒館，
+  // 終端機空白、cache-log 那一發不存在、requestCount 不加，事後看 log 像「那一發沒發生過」。
+  // 讓位／斷線造成的中斷不算錯（那是設計），不記。
+  let counted = false;   // requestCount 這發加過了沒（正常路徑加在收尾，拋錯路徑加在這裡，不重複）
+  const noteSdkError = (err, mode) => {
+    if (ticket.aborted) return;
+    if (!counted) { requestCount++; counted = true; }
+    const msg = String((err && err.message) || err).slice(0, 300);
+    console.error(`[${PLUGIN_ID}][${requestCount}] SDK 拋錯：${msg}`);
+    appendCacheLog({ t: new Date().toISOString(), n: requestCount, mode, error: msg });
+  };
 
   // 酒館斷線（超時、按停止、關頁面）→ 立刻放手，別讓下一則卡在門口
   let finished = false;
@@ -1496,17 +1525,31 @@ async function handleChatCompletions(req, res) {
       return;
     }
 
-    const { messages, model: requestModel, stream } = parsed;
+    // 26-09-02（審核 A9）：JSON.parse('null') 會成功，直接解構就炸成 500 帶 JS 內部錯誤字串。
+    // 不是物件（null／陣列／字串／數字）一律 400——那是客戶端的錯，不是伺服器的。
+    const isObj = parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed);
+    const { messages, model: requestModel, stream } = isObj ? parsed : {};
 
-    if (!Array.isArray(messages)) {
+    if (!isObj || !Array.isArray(messages)) {
       if (!res.headersSent) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'messages must be an array', type: 'invalid_request' } }));
+        res.end(JSON.stringify({ error: { message: isObj ? 'messages must be an array' : 'request body must be a JSON object', type: 'invalid_request' } }));
       }
       return;
     }
 
-    const modelId = requestModel || 'claude-opus-4-6[1m]';
+    // 酒館在 body 還沒讀完就斷線（26-09-02 審核 A8）：這則已經沒人要了——不讓位、不呼叫 SDK。
+    // 以前這裡照樣 spawn CLI 把 prompt 送出去，API 端多半已計 input tokens，白燒一發。
+    if (ticket.aborted) return;
+
+    // 新的一則進來＝玩家要這一則，前一則直接讓位（不再回 429 把人擋在門外；26-07-25 Mini 拍板）。
+    // 26-09-02（審核 A6，Mini 拍板 ⑦）讓位**移到驗證之後**：以前任何 POST 進來先讓位再驗證，
+    // 一個註定回 400／413 的壞請求（監控腳本、瀏覽器預檢、另一個分頁的測試連線）也會把
+    // 正在生成的主回覆殺掉。讓位語義是「玩家要新的一則」，壞請求不是玩家要的那一則。
+    await releaseCurrent('新請求進來');
+    current = ticket;
+
+    modelId = requestModel || 'claude-opus-4-6[1m]';
     const parsedMsgs = parseMessages(messages);
     const { systemPrompt, prompt, images, headerEnd } = parsedMsgs;
     // 斷點：量測模式與拆塊模式共用同一次計算（兩邊各算一次會讓第二次拿自己當基準，
@@ -1520,11 +1563,10 @@ async function handleChatCompletions(req, res) {
     // 為什麼要它：一位使用者的「擴充功能 7,074 token」在酒館面板只有總數、內建子項全是 0——
     // 那七千來自第三方擴充的注入，只存在於送出的那一刻，檔案裡看不到，只有這裡看得到。
     const comp = composeTurns(messages, headerEnd, evaluated.prevFps, { fps: evaluated.fps });
-    // 前綴指紋：只在 TCB_PREFIX_TRACE=1 時動作，兩條路徑（串流／非串流）都在這之後分岔，
-    // 所以放這裡一次涵蓋——8/01 只改非串流那份、真實情境一次都沒觸發，不再犯。
-    tracePrefix(systemPrompt, prompt, requestCount + 1);
-    // 斷點量測（TCB_TURN_TRACE=1 才動）：算出斷點該落在哪一則並落檔，但**不改變送出去的東西**。
-    // 放在同一個位置、同樣理由——兩條路徑在這之後才分岔。
+    // 斷點量測：算出斷點該落在哪一則並落檔，但**不改變送出去的東西**。
+    // 放在兩條路徑（串流／非串流）分岔之前，一次涵蓋——8/01 只改非串流那份、真實情境一次都沒觸發，不再犯。
+    // （26-08-02 定位兇手用的前綴切段雜湊工具已於 26-09-02 退役（審核 B7③，Mini 拍板 ⑩）——
+    //   turn-log 逐則指紋＋cache-log 的 sysHash 覆蓋同一件事。）
     // traceTurns 移到拆塊決策之後（見下方）——落檔要記「這發到底有沒有真的拆」，
     // 不然「沒貼標記」與「貼了沒作用」在讀數上長得一模一樣，分不出來。
     // 26-08-02 首次上線就撞到這個缺口：cacheRead 沒跳，而我手上沒有任何資料能說是哪一種。
@@ -1541,7 +1583,7 @@ async function handleChatCompletions(req, res) {
       warnedNoSystemPrompt = true;
       console.warn(`[${PLUGIN_ID}] 注意：本次請求有 ${sysCount} 則系統訊息，但系統提示是空的——你的對話開頭是使用者訊息，所以每一則 system 都留在對話流的原位（位置語義優先）。角色扮演若不穩定，可從預設的訊息結構查起。此訊息每次啟動只出現一次。`);
     }
-    const completionId = `chatcmpl-${randomUUID().slice(0, 8)}`;
+    completionId = `chatcmpl-${randomUUID().slice(0, 8)}`;
     // 有圖 → 串流輸入模式（SDK 才收得到 image block）；沒圖 → 維持原本的字串 prompt
     const hasImages = images.length > 0;
 
@@ -1660,7 +1702,12 @@ async function handleChatCompletions(req, res) {
           : prompt
     );
 
-    if (stream === false) {
+    // 讓位期間（await releaseCurrent）酒館若已斷線，這裡再擋一次——SDK 一發都別燒
+    if (ticket.aborted) return;
+
+    // 26-09-02（審核 A12，Mini 拍板 ⑧）：stream 缺省走 JSON——OpenAI 規範預設 stream=false。
+    // 以前 `=== false` 才走 JSON，curl／第三方客戶端不帶 stream 會拿到一坨 data: 行。酒館永遠帶布林，不受影響。
+    if (stream !== true) {
       try {
         let fullText = '';
         let thinkingText = '';
@@ -1731,7 +1778,7 @@ async function handleChatCompletions(req, res) {
         ? { usage: resultUsage, modelUsage: resultModelUsage }
         : await readUsage(q);
 
-        requestCount++;
+        requestCount++; counted = true;
         totalCostUsd += costUsd;
 
         // 快取讀數（26-08-01 加）。省額度的關鍵在快取有沒有命中，但這個數字
@@ -1741,9 +1788,11 @@ async function handleChatCompletions(req, res) {
         // 跟 Messages API 不同、也可能包一層。寫死名字的後果不是報錯，是印出
         // undefined 然後看起來像「沒有快取」——拿著含有答案的資料說查不到。
         // 記帳走共用的 recordUsage（串流那條也呼叫同一支，避免只改一半）
-        const { cacheFields, cacheRead, hitPct } = recordUsage(usage, {
+        const { cacheFields, cacheRead, hitPct, inTok, outTok } = recordUsage(usage, {
           reqNo: requestCount, mode: 'json', modelId, effort: configEffort,
           shape, imgCount: hasImages ? images.length : 0, costUsd,
+          // 26-09-02（審核 A4）：跟串流那條同款——帳上要看得出這發被打斷（console 後綴＋cache-log 的 aborted）
+          aborted: ticket.aborted, suffix: ticket.aborted ? ' (讓位/斷線)' : '',
           splitApplied: splitInfo.applied,
           splitReason: splitInfo.reason,
           splitDivergence: splitInfo.divergence ?? null,
@@ -1775,7 +1824,9 @@ async function handleChatCompletions(req, res) {
           choices: [{
             index: 0,
             message: { role: 'assistant', content: fullText, ...(thinkingText && { reasoning_content: thinkingText }) },
-            finish_reason: 'stop',
+            // 26-09-02（審核 A4，Mini 拍板 ⑥）：被讓位／斷線的那則回 length（OpenAI 慣例的「沒寫完」）。
+            // 以前回 stop——半截當完整回覆送出去，客戶端分不出來。
+            finish_reason: ticket.aborted ? 'length' : 'stop',
           }],
         };
         if (usage) {
@@ -1784,10 +1835,13 @@ async function handleChatCompletions(req, res) {
           // 收回了：usage_EXPERIMENTAL() 的 input_tokens 含不含快取沒有保證，
           // 如果它本來就是總和，加上去就是重複計算——酒館顯示的用量會直接翻倍。
           // 診斷欄位只該用加的；改動既有欄位的語意，要等實跑數字對過帳再說。
+          // 26-09-02（審核 A1）：三欄改用 recordUsage 攤平後的 inTok／outTok。usage 變數在上面已被包成
+          // { usage, modelUsage }，舊碼讀 usage.input_tokens 永遠 undefined → 三欄恆 0（cached_tokens 卻是對的）。
+          // 語意不動：prompt_tokens 仍是 SDK 給的 input_tokens（含不含快取由 SDK 定，這裡不自己加總）。
           responseBody.usage = {
-            prompt_tokens: usage.input_tokens || 0,
-            completion_tokens: usage.output_tokens || 0,
-            total_tokens: (usage.input_tokens || 0) + (usage.output_tokens || 0),
+            prompt_tokens: inTok || 0,
+            completion_tokens: outTok || 0,
+            total_tokens: (inTok || 0) + (outTok || 0),
           };
           if (Object.keys(cacheFields).length) {
             // OpenAI 相容陣營的慣例欄位，酒館與多數前端認得
@@ -1804,6 +1858,7 @@ async function handleChatCompletions(req, res) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(responseBody));
       } catch (err) {
+        noteSdkError(err, 'json');
         if (!res.headersSent) {
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: { message: humanError(err), type: 'server_error' } }));
@@ -1823,28 +1878,30 @@ async function handleChatCompletions(req, res) {
     const roleChunk = makeChunk(completionId, modelId, { role: 'assistant', content: '' }, null);
     res.write(`data: ${JSON.stringify(roleChunk)}\n\n`);
 
-    const q = queryFn({
-      prompt: buildPrompt(),
-      options: {
-        systemPrompt: systemPromptForSdk(systemPrompt),
-        tools: [],
-        // 省掉自動標題生成——見非串流那處的完整說明。
-        // （這條是酒館實際會走的路徑；上次只改非串流那份，等於改了沒用。）
-        title: process.env.TCB_AUTO_TITLE === '1' ? undefined : 'SillyTavern bridge',
-        maxTurns: 1,
-        model: modelId,
-        permissionMode: 'dontAsk',
-        persistSession: persistSessionOption(),
-        includePartialMessages: true,
-        settingSources: [],
-        ...thinkingOption(),
-        ...effortOption(),
-      },
-    });
-    ticket.q = q;
     // 斷線／讓位的處理統一在函式開頭那個 res.on('close') 與 releaseCurrent()，這裡不再另掛
-
     try {
+      // 26-09-02（審核 A2）：queryFn 呼叫搬進 try。以前在 try 外——SSE 標頭已送出後它若同步拋錯，
+      // 會跳到外層 catch，而外層只在 !headersSent 才回應：連線懸掛到酒館超時、終端機一個字都沒有。
+      const q = queryFn({
+        prompt: buildPrompt(),
+        options: {
+          systemPrompt: systemPromptForSdk(systemPrompt),
+          tools: [],
+          // 省掉自動標題生成——見非串流那處的完整說明。
+          // （這條是酒館實際會走的路徑；上次只改非串流那份，等於改了沒用。）
+          title: process.env.TCB_AUTO_TITLE === '1' ? undefined : 'SillyTavern bridge',
+          maxTurns: 1,
+          model: modelId,
+          permissionMode: 'dontAsk',
+          persistSession: persistSessionOption(),
+          includePartialMessages: true,
+          settingSources: [],
+          ...thinkingOption(),
+          ...effortOption(),
+        },
+      });
+      ticket.q = q;
+
       let costUsd = 0;
       let resultUsage = null;      // result 訊息自帶的 usage（Messages API 形狀）
       let resultModelUsage = null; // result 訊息自帶的 modelUsage（駝峰形狀）
@@ -1897,7 +1954,7 @@ async function handleChatCompletions(req, res) {
         ? { usage: resultUsage, modelUsage: resultModelUsage }
         : await readUsage(q);
 
-      requestCount++;
+      requestCount++; counted = true;
       totalCostUsd += costUsd;
       // 串流路徑（酒館的預設路徑）——記帳跟非串流走同一支 recordUsage
       recordUsage(usage, {
@@ -1920,29 +1977,35 @@ async function handleChatCompletions(req, res) {
         aborted: ticket.aborted, suffix: ticket.aborted ? ' (讓位/斷線)' : '',
       });
 
-      if (!ticket.aborted) {
-        // 整輪一個字都沒送出＝空回覆。印黑盒子，並補一則通知取代空白畫面（26-07-27 外部使用者案）
-        if (!sentText) {
-          const notice = makeChunk(completionId, modelId, { content: emptyReplyNotice(requestCount, blockTypes, diag) }, null);
-          res.write(`data: ${JSON.stringify(notice)}\n\n`);
-        }
-        const stopChunk = makeChunk(completionId, modelId, {}, 'stop');
-        res.write(`data: ${JSON.stringify(stopChunk)}\n\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
+      // 整輪一個字都沒送出＝空回覆。印黑盒子，並補一則通知取代空白畫面（26-07-27 外部使用者案）。
+      // 被讓位／斷線的不算空回覆——那是被打斷，不是模型沒話講。
+      if (!ticket.aborted && !sentText && resAlive()) {
+        const notice = makeChunk(completionId, modelId, { content: emptyReplyNotice(requestCount, blockTypes, diag) }, null);
+        res.write(`data: ${JSON.stringify(notice)}\n\n`);
       }
+      // 26-09-02（審核 A4，Mini 拍板 ⑥）：被讓位的那則以前**不收尾**（無 stop chunk、無 [DONE]、不 end）——
+      // 打斷者若不是酒館自己（酒館按停止會 abort fetch，那條走 res 'close'），連線就吊到客戶端超時。
+      // 現在只要連線還活著就收尾；finish_reason 用 length 標「沒寫完」，跟非串流同一套說法。
+      endSse(ticket.aborted ? 'length' : 'stop');
     } catch (err) {
-      if (!ticket.aborted) {
-        const errChunk = makeChunk(completionId, modelId, { content: `\n\n[${humanError(err)}]` }, 'stop');
+      noteSdkError(err, 'stream');
+      if (!ticket.aborted && resAlive()) {
+        const errChunk = makeChunk(completionId, modelId, { content: `\n\n[${humanError(err)}]` }, null);
         res.write(`data: ${JSON.stringify(errChunk)}\n\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
       }
+      endSse(ticket.aborted ? 'length' : 'stop');
     }
   } catch (err) {
+    noteSdkError(err, res.headersSent ? 'stream' : 'json');
     if (!res.headersSent) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: { message: humanError(err), type: 'server_error' } }));
+    } else if (resAlive()) {
+      // 26-09-02（審核 A2）：標頭已送（串流）才炸到這層——以前這裡什麼都不做也不 end，酒館掛到超時。
+      // 補一個 error chunk 再收尾：畫面上看得到原因、連線關得掉。
+      const errChunk = makeChunk(completionId, modelId, { content: `\n\n[${humanError(err)}]` }, null);
+      res.write(`data: ${JSON.stringify(errChunk)}\n\n`);
+      endSse('stop');
     }
   } finally {
     finished = true;
@@ -2166,6 +2229,6 @@ async function exit() {
 // _setQueryFn 僅供測試：把 SDK 的 query 換成假的，讓契約測試驗「送進 SDK 的 options」與
 // 「thinking block 關閉時不回酒館」的完整請求鏈（Grok MED-5），不必實彈也不佔真額度。
 function _setQueryFn(fn) { queryFn = fn; }
-// tracePrefix 一併 export：測試要驗的是**本體**，不是複製一份邏輯去測
+// traceTurns 一併 export：測試要驗的是**本體**，不是複製一份邏輯去測
 // （複製品測過≠本體會動，26-08-01 只改非串流那份的同族教訓）
-export { info, init, exit, parseMessages, thinkingOption, handleChatCompletions, _setQueryFn, tracePrefix, traceTurns, splitPromptBlocks, makeSplitPrompt, splitEnabled, cacheSummary };
+export { info, init, exit, parseMessages, thinkingOption, handleChatCompletions, _setQueryFn, traceTurns, splitPromptBlocks, makeSplitPrompt, splitEnabled, cacheSummary };

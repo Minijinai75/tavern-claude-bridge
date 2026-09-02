@@ -2,7 +2,7 @@ const PLUGIN_ID = 'tavern-claude-bridge';
 const API_BASE = `/api/plugins/${PLUGIN_ID}`;
 const UI_PREFIX = 'tcb';
 const SETTINGS_KEY = 'tavern_claude_bridge';
-const LOCAL_VERSION = '1.8.7';
+const LOCAL_VERSION = '1.8.8';
 const GITHUB_RELEASE_API = 'https://api.github.com/repos/Minijinai75/tavern-claude-bridge/releases/latest';
 let updateCache;
 
@@ -116,7 +116,7 @@ function buildPanel() {
             <input type="checkbox" id="${UI_PREFIX}-split">
             <span>拆塊省快取（建議開著）</span>
           </label>
-          <small id="${UI_PREFIX}-split-note">把對話裡「已經不會再變」的那一大段獨立標記起來快取，下一則就不用整包重算。實測一則從 $2.35 降到 $0.71。改設定、改世界書、切換角色卡都會讓它重建一次，那是正常的。覺得回覆怪怪的就先關掉，橋會退回原本的送法。</small>
+          <small id="${UI_PREFIX}-split-note">把對話裡「已經不會再變」的那一大段獨立標記起來快取，下一則就不用整包重算。實測一則從 $2.35 降到 $0.71。改設定、切換角色卡都會重建一次；世界書分兩種：關鍵字觸發的條目每次開關都會重建，常駐條目改內容才重建一次——這些都是正常的。覺得回覆怪怪的就先關掉，橋會退回原本的送法。</small>
         </div>
         <div class="${UI_PREFIX}-option">
           <label class="checkbox_label">
@@ -216,6 +216,28 @@ function buildPanel() {
   // 哪些是換算（幾倍）——不分的話，回報回來的數字沒有人分得出哪個能當證據。
   const 千分位 = n => (n || 0).toLocaleString('en-US');
 
+  // 系統提示漂移的說法，按後端分型（26-09-02 審核 C9）：
+  //   lastSystemRecurring === true  → 有東西時有時無（關鍵字觸發條目那型）
+  //   lastSystemRecurring === false → 每則都是新值（時間戳那型）
+  //   沒有這格（舊版橋／還沒量到）→ 通用文案
+  // **舊版那句「挪去對話尾端、條目用 @D 深度插入」的建議已刪**——26-09-01 實測 @D 本身也會落進系統區，會把人帶回同一個坑。
+  const 漂移文案 = (c) => {
+    const 開頭 = '你的系統提示每則都在變（角色卡＋預設組出來的那一大段）。'
+      + '它排在對話前面，一變整包快取就作廢——拆塊救不了這種。';
+    if (c.lastSystemRecurring === true) {
+      return 開頭 + '形狀是「有東西時有時無」：多半是世界書的關鍵字觸發條目（綠燈）——這則被觸發、下則沒有，'
+        + '系統提示就跟著變。把常用的那幾條改成常駐、或把觸發條件收窄，變動就會少。';
+    }
+    if (c.lastSystemRecurring === false) {
+      return 開頭 + '形狀是「每則都是新值」：多半是時間戳、隨機數、每則重算的變數這類巨集。'
+        + '找出系統提示裡會跟著時間或亂數變的那一段，拿掉或固定住。';
+    }
+    return 開頭 + '常見來源：世界書的關鍵字觸發條目（綠燈）、每則重算的注入、時間戳。';
+  };
+  const 漂移短句 = (c) => c.lastSystemRecurring === true ? '有東西時有時無（關鍵字觸發條目那型）'
+    : c.lastSystemRecurring === false ? '每則都是新值（時間戳那型）'
+    : '型態未分（舊版橋或樣本不足）';
+
   function renderCache(b) {
     if (!cacheEl) return;
     cacheEl.textContent = '';
@@ -262,46 +284,61 @@ function buildPanel() {
       警.className = `${UI_PREFIX}-cache-warn`;
       警.textContent = `⚠️ ${c.splitWarning.text}`;
       cacheEl.appendChild(警);
+    }
 
-      // 系統提示漂移單獨再講一次——它跟「拆塊沒生效」是兩件事，而且它是拆塊救不了的那種。
-      // 26-08-27 實案：使用者想貼診斷給我，在終端機翻兩次都找不到那行（會被輸出捲走）。
-      // 診斷的成本不該由使用者付，所以搬到面板上。
-      if (c.lastSystemDrift) {
-        const 漂 = document.createElement('div');
-        漂.className = `${UI_PREFIX}-cache-warn`;
-        漂.textContent = '⚠️ 你的系統提示每則都在變（角色卡＋預設組出來的那一大段）。'
-          + '它排在對話前面，一變整包快取就作廢——拆塊救不了這種。'
-          + '常見來源：世界書的關鍵字觸發條目（綠燈）、每則重算的注入、時間戳。'
-          + '修法是把那些東西挪到對話尾端的會動區（世界書條目改成 @D 深度插入）。';
-        cacheEl.appendChild(漂);
-      }
+    // 系統提示漂移**獨立判斷、不包在 splitWarning 裡**（26-09-02 審核 C9）——
+    // 它跟「拆塊沒生效」是兩件事：拆塊率健康、但 systemPrompt 每發都變的時候，
+    // cacheRead 只剩系統包、對話流全毀，舊寫法卻因為 splitWarning 為 null 整段不顯示。
+    // 26-08-27 實案：使用者想貼診斷給我，在終端機翻兩次都找不到那行（會被輸出捲走）。
+    // 診斷的成本不該由使用者付，所以搬到面板上。
+    if (c.lastSystemDrift) {
+      const 漂 = document.createElement('div');
+      漂.className = `${UI_PREFIX}-cache-warn`;
+      漂.textContent = `⚠️ ${漂移文案(c)}`;
+      cacheEl.appendChild(漂);
     }
 
     // ── 細節收進摺疊：回報用的證據，不是給人讀的第一句 ──────────────
     const 細節 = document.createElement('details');
     const 摘要 = document.createElement('summary');
     摘要.textContent = '詳細數據（回報給我們的時候用這個）';
+    // 「注入」「移位」對玩酒館的人沒解釋（26-09-02 審核 C12c）——滑鼠停在標題上就看得到
+    摘要.title = '注入＝世界書／擴充插進對話裡的內容；移位＝內容沒變、只是位置往後挪';
     細節.appendChild(摘要);
 
     // 快取到底幫你省了還是多花了——**報數字不報賺賠，等於沒說**（26-08-29 第九種形狀）。
     // 判定由後端 cacheRoi 算（連續兩發間隔＋這發有沒有讀到），這裡只負責講人話。
+    // 金額為 null（後端查不到這個模型的價目）時只印 token、不印 US$（26-09-02 審核 C10b）。
     const 快取划算嗎 = (roi) => {
       if (!roi || roi.verdict === 'unknown') return '';
       const 錢 = (n) => `US$${Number(n).toFixed(4)}`;
+      const 無價 = roi.extraUsd == null || roi.savedUsd == null;
+      const 多付 = 無價
+        ? `新建 ${千分位(roi.writeTok)} tokens 的兩倍價差（這個模型沒有價目表，不換算成 US$）`
+        : `約 ${錢(roi.extraUsd)}`;
+      const 省下 = 無價
+        ? `讀到 ${千分位(roi.readTok)} tokens 的折價`
+        : `約 ${錢(roi.savedUsd)}`;
       if (roi.verdict === 'wasted') {
         const 間隔 = typeof roi.lastGapHours === 'number' && roi.lastGapHours >= 1
           ? `距上一則隔了 ${roi.lastGapHours.toFixed(1)} 小時，上次的快取早就過期了。`
           : '';
         return `⚠️ 這段期間的快取沒有回本：${間隔}`
           + `新建快取付的是一般輸入的兩倍價，而這 ${roi.writes} 發建立的快取一次都沒讀到，`
-          + `等於多付了約 ${錢(roi.extraUsd)}。`
+          + `等於多付了${多付}。`
           + `如果你通常隔幾小時才玩一則，快取在你身上是淨成本——這不是設定錯，是玩法跟快取的有效期對不上。`;
       }
-      if (roi.verdict === 'paying-off') {
-        return `✅ 快取有回本：這段期間讀到快取省下約 ${錢(roi.savedUsd)}，`
-          + `扣掉新建多付的 ${錢(roi.extraUsd)} 仍然是划算的。`;
+      // 有讀到、但多付是省下的三倍以上（26-09-02 審核 C10a）——舊版把這種也叫「打平附近」
+      if (roi.verdict === 'wasted_heavy') {
+        return `⚠️ 這段期間的快取多付遠大於省下：讀到快取只省了${省下}，新建卻多付了${多付}——多付是省下的三倍以上。`
+          + `多半是一直在重建、很少讀到（間隔太長，或每發都有東西在變）。`
+          + `如果你通常隔幾小時才玩一則，快取在你身上接近淨成本——這不是設定錯，是玩法跟快取的有效期對不上。`;
       }
-      return `快取目前打平附近：省下 ${錢(roi.savedUsd)}、新建多付 ${錢(roi.extraUsd)}。`;
+      if (roi.verdict === 'paying-off') {
+        return `✅ 快取有回本：這段期間讀到快取省下${省下}，`
+          + `扣掉新建多付的${多付}仍然是划算的。`;
+      }
+      return `快取目前打平附近：省下${省下}、新建多付${多付}。`;
     };
 
     const 倍 = c.savedRatio;
@@ -312,8 +349,10 @@ function buildPanel() {
         + `｜${c.requests} 則裡有 ${c.splitApplied} 則拆到塊`,
       `輸入 token：讀到快取 ${千分位(c.cacheRead)}／新建快取 ${千分位(c.cacheWrite)}／未快取 ${千分位(c.input)}`,
       // 26-09-02 組成表（CX-260902-01）：這一發送了什麼——系統區／對話／注入各多少、跟上一發比幾則變幾則移位。
-      // 字串由後端組（cacheSummary.lastCompLine），這裡只印，不另算。
-      c.lastCompLine || '',
+      // 字串由後端組（cacheSummary.lastCompLine），這裡只印，不另算；前面補一句白話（26-09-02 審核 C12c）。
+      c.lastCompLine
+        ? `這一則送了什麼：${c.lastCompLine}\n（注入＝世界書／擴充插進對話裡的內容；移位＝內容沒變、只是位置往後挪）`
+        : '',
       // 那筆「新建」的錢有沒有收回來（26-08-29）。只報數字的話，「新建快取 50,000」
       // 看起來像做了好事——實際上新建是一般輸入的兩倍價，隔幾小時才玩一則的人一次都收不回。
       快取划算嗎(c.cacheRoi),
@@ -342,7 +381,17 @@ function buildPanel() {
         + `｜${c.requests} 則裡有 ${c.splitApplied} 則拆到塊`,
       `讀快取 ${c.cacheRead}／新建快取 ${c.cacheWrite}／未快取 ${c.input} tokens`,
       倍 ? `累計換算 ${倍} 倍（含開頭建立費，剛開始會小於 1）` : '累計換算：資料不足',
-    ].join('\n');
+      // 診斷四行（26-09-02 審核 C10c）：按鈕說「回報給我們的時候用這個」，最需要回報的診斷以前全不在剪貼簿裡。
+      c.splitWarning ? `⚠️ 拆塊警告：${c.splitWarning.text}` : '',
+      c.lastSystemDrift ? `⚠️ 系統提示漂移：${漂移短句(c)}` : '',
+      c.cacheRoi && c.cacheRoi.verdict !== 'unknown'
+        ? `快取回本判定：${c.cacheRoi.verdict}`
+          + (c.cacheRoi.extraUsd == null || c.cacheRoi.savedUsd == null
+            ? `（新建 ${c.cacheRoi.writeTok} tok／讀到 ${c.cacheRoi.readTok} tok；此模型沒有價目，不換算 US$）`
+            : `（省下 US$${Number(c.cacheRoi.savedUsd).toFixed(4)}、新建多付 US$${Number(c.cacheRoi.extraUsd).toFixed(4)}）`)
+        : '',
+      c.lastCompLine ? `這一則送了什麼：${c.lastCompLine}` : '',
+    ].filter(Boolean).join('\n');
     btn.addEventListener('click', async () => {
       try {
         await navigator.clipboard.writeText(純文字);
