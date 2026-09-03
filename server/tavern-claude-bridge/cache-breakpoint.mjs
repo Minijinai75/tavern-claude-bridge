@@ -92,6 +92,19 @@ export function fingerprintTurns(messages) {
 }
 
 /**
+ * 整串訊息的長度陣列（26-09-03，CX-260903-01 ②）。
+ *
+ * 為什麼指紋之外還要存長度：綾的實測（26-09-03）——酒館把同 position 的觸發條目**合併成一則**，
+ * 而多則共用同一個 order 值時排序不保證穩定，於是出現「長度相同、則數相同、**只有內容順序不同**」。
+ * 指紋只答得出「一不一樣」，答不出「一樣長還是連長度都變了」——而這兩件的病因與修法完全不同：
+ * 長度也變＝觸發組合換了（哪幾條進來不一樣）；長度沒變只換順序＝排序不穩（order 撞號）。
+ * 光存指紋做不到這個分辨，所以基準要多存一份長度。長度是數字，不含內容。
+ */
+export function lengthsOfTurns(messages) {
+  return (messages || []).map(m => textOfTurn(m).length);
+}
+
+/**
  * Anthropic 的每百萬 token 單價——Opus 4.6 那組（歷史匯出名，保留給還在 import 它的人）。
  *
  * 出處（26-08-29）：外部工程凌敘從真實 cache-log 拿六筆帳單反推、另外四筆驗算，
@@ -711,8 +724,10 @@ export function kindOfTurn(msg, i, headerEnd = 0) {
  * @param {object[]} messages  這一發完整訊息陣列（含 header）
  * @param {number} headerEnd   系統區止於第幾則（parseMessages 算的，這裡不重算——判準只能有一份）
  * @param {string[]|null} prevFps 上一發的指紋陣列（fingerprintTurns 的結果）；沒有就 null
+ * @param {object} opts fps＝這一發算好的指紋（不重算）；prevLens＝上一發的長度陣列（lengthsOfTurns），
+ *                      有給才算得出 sameLenDiffContent（26-09-03 ②）
  */
-export function composeTurns(messages, headerEnd = 0, prevFps = null, { fps: fpsIn } = {}) {
+export function composeTurns(messages, headerEnd = 0, prevFps = null, { fps: fpsIn, prevLens = null } = {}) {
   const msgs = Array.isArray(messages) ? messages : [];
   // 呼叫端已算過這一發的指紋（evaluateBreakpoint）就直接用——每發兩次全量 sha1 是浪費
   const fps = Array.isArray(fpsIn) && fpsIn.length === msgs.length ? fpsIn : fingerprintTurns(msgs);
@@ -762,7 +777,62 @@ export function composeTurns(messages, headerEnd = 0, prevFps = null, { fps: fps
     inj: agg('inj', true),
     gone: hasPrev ? prevFps.length - used.size : null,
   };
+
+  // 系統區的兩格細節（26-09-03，CX-260903-01 ②）。只放 sys——那是「一變整包快取全毀」的那一段，
+  // 也是綾唯一需要指名道姓的地方；注入區跟著對話走，逐則指名沒有可操作性。
+  //
+  // changedIdx：changed 是則數，答不出「是哪幾則」——而建議句要點名（見 sysDriftAdvice）。
+  //             判準跟 changed 同一條（vs === 'new'），兩處不准各算一次。
+  // sameLenDiffContent：**同一個位置、長度一樣、內容雜湊不同**。
+  //             這格是為綾 26-09-03 那個形狀開的：她的 idx 10 兩發都是 4130 字元、開頭卻不一樣——
+  //             合併區塊裡多則共用同一個 order，排序不保證穩定，於是則數同、長度同、順序不同。
+  //             舊的 changed／moved 對這型完全瞎：它跟「內容真的改了」在讀數上一模一樣，
+  //             而使用者看到「長度沒變」會直覺認為「那就不是它」——診斷把人帶去查錯地方。
+  //             這裡比的是**同位置**（prevFps[i] vs fps[i]），不是指紋查表：位置移動那型歸 moved 管。
+  summary.sys.changedIdx = hasPrev ? turns.filter(t => t.kind === 'sys' && t.vs === 'new').map(t => t.i) : null;
+  summary.sys.sameLenDiffContent = (hasPrev && Array.isArray(prevLens) && prevLens.length)
+    ? turns.filter(t => t.kind === 'sys'
+        && typeof prevFps[t.i] === 'string' && prevFps[t.i] !== fps[t.i]
+        && prevLens[t.i] === t.len).map(t => t.i)
+    : null;
+
   return { turns, summary, fps };
+}
+
+/** 連續漂移幾發才開口（26-09-03 ③）。1、2 發可能只是換了角色卡或剛改完設定，不值得指認。 */
+export const SYS_DRIFT_STREAK_MIN = 3;
+
+/**
+ * 系統區連續漂移的建議句（26-09-03，CX-260903-01 ③）。回 null＝不出聲。
+ *
+ * **只由實測到的連續漂移觸發**——這條是外部工程凌敘 26-09-03 給的守門線，不是潔癖：
+ * 使用者吟雪同樣有 2 條綠燈（關鍵字觸發條目）插在系統提示區、3,258 字元，
+ * 但橋兩次量到的系統塊都是 9,322，一個 token 都沒差。
+ * 所以「系統區有幾條綠燈／系統區多長／有幾則」這類**靜態特徵推論不出漂移**，
+ * 拿它當觸發條件＝對沒病的人喊病，而診斷喊錯一次，下次真的喊了也沒人信。
+ * 這支只吃兩個參數：連續漂了幾發、是哪幾則——兩個都是量出來的。
+ *
+ * 措辭上的一個坑（26-09-01 立、26-09-03 承曦裁決後定案）：面板原本有一句「把條目改成 @D 深度插入」，
+ * 後來刪掉了，因為**深度注入本身也可能落回系統提示區**，那句會把人帶回同一個坑。
+ * 但 26-09-01 刪那句的真正問題是「只給方向不給驗證法」——現在有驗證法了，不給下一步
+ * 反而是把人丟在半路。所以下一步照給，**把驗證那一步寫進句子裡**：改完再玩一則回來看這句還在不在。
+ *
+ * 另一條（吟雪的教訓，26-09-03 承曦裁）：**用使用者看得到的字，不是我們自己的字**。
+ * 「深度注入」是酒館世界書那一格的欄位名，她在面板上找得到；只寫「@D」她不知道要點哪裡。
+ */
+export function sysDriftAdvice(streak, idx) {
+  if (!(typeof streak === 'number' && streak >= SYS_DRIFT_STREAK_MIN)) return null;
+  if (!Array.isArray(idx) || idx.length === 0) return null;
+  const 則 = idx.join('、');
+  const 這幾則 = idx.length === 1 ? '這一則' : idx.length === 2 ? '這兩則' : '這幾則';
+  return `系統提示第 ${則} 則連續 ${streak} 發每一發都在變。`
+    + `它們排在整包內容的**最前面**，最前面一變，後面全部的快取跟著作廢——這一層拆塊救不了。`
+    + `這型多半是世界書「關鍵字觸發」的條目（綠燈）全放在提示詞開頭，被酒館合併成同一大塊：`
+    + `每回合被觸發的是哪幾條都不一樣，合出來的那塊就每發不一樣。`
+    + `想修就得把${這幾則}背後的條目搬出系統提示區——`
+    + `把插入位置從「提示詞開頭」改成插進對話裡（酒館的世界書裡那格叫「深度注入」或 @D），`
+    + `或者把最常用的那幾條改成常駐、讓內容每發固定下來。`
+    + `**改完再玩一則、回來看這句還在不在**：有些深度注入設定仍然會落回系統提示區，這句消失了才算真的搬走。`;
 }
 
 /** 面板／console 那一行。數字取自 summary，不另外算——兩處各算一次遲早各說各話。 */

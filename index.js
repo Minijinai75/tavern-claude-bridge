@@ -2,7 +2,7 @@ const PLUGIN_ID = 'tavern-claude-bridge';
 const API_BASE = `/api/plugins/${PLUGIN_ID}`;
 const UI_PREFIX = 'tcb';
 const SETTINGS_KEY = 'tavern_claude_bridge';
-const LOCAL_VERSION = '1.9.2';
+const LOCAL_VERSION = '1.9.3';
 const GITHUB_RELEASE_API = 'https://api.github.com/repos/Minijinai75/tavern-claude-bridge/releases/latest';
 let updateCache;
 
@@ -122,7 +122,7 @@ function buildPanel() {
             <input type="checkbox" id="${UI_PREFIX}-split">
             <span>拆塊省快取（建議開著）</span>
           </label>
-          <small id="${UI_PREFIX}-split-note">快取＝讓 Claude 記住上一則已經讀過的東西，下一則只重算新的部分、少付錢。打勾後，橋會把對話裡「已經不會再變」的那一大段單獨圈起來記住，下一則就不用整包重算。實測一則從 $2.35 降到 $0.71。改設定、切換角色卡都會重建一次；世界書分兩種：關鍵字觸發的條目每次開關都會重建，常駐條目改內容才重建一次——這些都是正常的。覺得回覆怪怪的就先關掉，橋會退回原本的送法。</small>
+          <small id="${UI_PREFIX}-split-note">快取＝讓 Claude 記住上一則已經讀過的東西，下一則只重算新的部分、少付錢。打勾後，橋會把對話裡「已經不會再變」的那一大段單獨圈起來記住，下一則就不用整包重算。實測一則從 $2.35 降到 $0.71。改設定、切換角色卡都會重建一次；世界書分兩種：關鍵字觸發的條目每次開關都會重建，常駐條目改內容才重建一次——這些都是正常的。覺得回覆怪怪的就先關掉，橋會退回原本的送法。要知道的一件事：這個勾勾只管橋自己釘的那些快取斷點，SDK（Claude 官方的程式套件）本身也會寫一份快取，那筆從這裡關不掉——所以就算你把這格關掉，帳單上還是會看到「新建快取」的數字，那不是這個勾勾沒生效。</small>
         </div>
         <div class="${UI_PREFIX}-option">
           <label class="checkbox_label">
@@ -357,6 +357,19 @@ function buildPanel() {
       cacheEl.appendChild(漂);
     }
 
+    // 系統區「連續好幾發都在變」的指名建議（26-09-03，CX-260903-01 ③）。
+    // 句子由後端組（cacheSummary().sysDriftAdvice），這裡只印——前端 import 不到後端函式，
+    // 兩邊各組一次遲早各說各話（跟 lastCompLine 同一條紀律）。
+    // 後端只在**實測到連續 3 發以上都在漂**時才給這格：「系統區有幾條綠燈」這類靜態特徵不算數
+    // （26-09-03 外部工程凌敘的反例：兩條綠燈插在系統區、兩發量到的系統塊一個 token 都沒差）。
+    // 沒給就整段不出現——**沒漂的人不該看到任何指認**。
+    if (c.sysDriftAdvice) {
+      const 指 = document.createElement('div');
+      指.className = `${UI_PREFIX}-cache-warn`;
+      指.textContent = `⚠️ ${c.sysDriftAdvice}`;
+      cacheEl.appendChild(指);
+    }
+
     // ── 細節收進摺疊：回報用的證據，不是給人讀的第一句 ──────────────
     const 細節 = document.createElement('details');
     const 摘要 = document.createElement('summary');
@@ -378,6 +391,13 @@ function buildPanel() {
       const 省下 = 無價
         ? `讀到 ${千分位(roi.readTok)} tokens 的折價`
         : `約 ${錢(roi.savedUsd)}`;
+      // 拆塊關著的時候一定要多講這句（26-09-03，CX-260903-01 ④）：一位使用者把拆塊關掉，
+      // 四發的「新建快取」仍然是六萬多、讀到 0——**SDK 自己也會寫快取，那筆面板關不掉**。
+      // 面板沒講這條界線，她只能推論成「關了也沒用，橋壞了」，還照舊文案去建議別人先關拆塊。
+      const sdkNote = b.split ? '' :
+        `你的拆塊是關著的，所以這筆新建快取**不是拆塊造成的**——`
+        + `那是 SDK（Claude 官方的程式套件）自己寫的，面板關不掉，關拆塊也停不了它。`;
+      // 26-09-03 承曦裁：wasted 與 wasted_heavy 的困惑一模一樣，兩個分支共用同一句，不各寫一份。
       if (roi.verdict === 'wasted') {
         const 間隔 = typeof roi.lastGapHours === 'number' && roi.lastGapHours >= 1
           ? `距上一則隔了 ${roi.lastGapHours.toFixed(1)} 小時，上次的快取早就過期了。`
@@ -385,12 +405,14 @@ function buildPanel() {
         return `⚠️ 這段期間的快取沒有回本：${間隔}`
           + `新建快取付的是一般輸入的兩倍價，而這 ${roi.writes} 發建立的快取一次都沒讀到，`
           + `等於多付了${多付}。`
+          + sdkNote
           + `如果你通常隔幾小時才玩一則，快取在你身上是淨成本——這不是設定錯，是玩法跟快取的有效期對不上。`;
       }
       // 有讀到、但多付是省下的三倍以上（26-09-02 審核 C10a）——舊版把這種也叫「打平附近」
       if (roi.verdict === 'wasted_heavy') {
         return `⚠️ 這段期間的快取多付遠大於省下：讀到快取只省了${省下}，新建卻多付了${多付}——多付是省下的三倍以上。`
           + `多半是一直在重建、很少讀到（間隔太長，或每發都有東西在變）。`
+          + sdkNote
           + `如果你通常隔幾小時才玩一則，快取在你身上接近淨成本——這不是設定錯，是玩法跟快取的有效期對不上。`;
       }
       if (roi.verdict === 'paying-off') {
@@ -447,6 +469,8 @@ function buildPanel() {
       // 診斷四行（26-09-02 審核 C10c）：按鈕說「回報給我們的時候用這個」，最需要回報的診斷以前全不在剪貼簿裡。
       c.splitWarning ? `⚠️ 拆塊警告：${c.splitWarning.text}` : '',
       c.lastSystemDrift ? `⚠️ 系統提示漂移：${漂移短句(c)}` : '',
+      // 連續漂移的指名建議也要進剪貼簿（26-09-03 ④）——最需要回報的那一句不能只活在畫面上
+      c.sysDriftAdvice ? `⚠️ ${c.sysDriftAdvice}` : '',
       c.cacheRoi && c.cacheRoi.verdict !== 'unknown'
         ? `快取回本判定：${c.cacheRoi.verdict}`
           + (c.cacheRoi.extraUsd == null || c.cacheRoi.savedUsd == null
