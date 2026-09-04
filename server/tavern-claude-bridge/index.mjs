@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 // 拆塊斷點掃描器（26-08-02，CX-260802-03）：只做「斷點該落在哪一則」的計算，
 // 不碰渲染也不貼標記——分工線在那支的檔頭註解。目前只被量測模式用到。
-import { fingerprintTurns, lengthsOfTurns, decideBreakpoint, stickyBreakpoint, meetsCacheMinimum, estimateTokens, minCacheTokensFor, trackSystemPrompt, analyzeShift, cacheRoi, shortDiff, textOfTurn, composeTurns, composeLine, kindOfTurn, sysDriftAdvice } from './cache-breakpoint.mjs';
+import { fingerprintTurns, lengthsOfTurns, kindsOfTurns, alignDialogue, CONV_OVERLAP_MIN_RATIO, CONV_OVERLAP_MIN_RUN, decideBreakpoint, stickyBreakpoint, meetsCacheMinimum, estimateTokens, minCacheTokensFor, trackSystemPrompt, analyzeShift, cacheRoi, shortDiff, textOfTurn, composeTurns, composeLine, kindOfTurn, sysDriftAdvice } from './cache-breakpoint.mjs';
 
 // ESM 沒有 __dirname，自己算（快取讀數落檔要用——見 appendCacheLog）
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -827,6 +827,12 @@ function recordUsage(usage, ctx) {
     // 26-09-03（CX-260903-01 ①）：這一發的基準從哪來——prev（上一發）／recall（翻回看過的鑰匙）／none（沒有）。
     // 綾 n=3 拿到看過的 key 卻判 fallback 那件事，沒有這格就只能靠猜。
     convBase: ctx.convBase ?? null,
+    // 26-09-04（CX-260904-01 ②）：位移量與「憑什麼判同一個對話」。
+    // usageCtx 早就帶著這兩格，entry 卻沒接——1.9.4 實彈打出來才發現（凌敘讀的是 cache-log 的欄位，
+    // 位移量只藏在 comp.dlg.offset 裡他得多剝一層，而 run／ratio 原本一格都沒有）。
+    // 同族的坑：這一版的「碼跑起來 ≠ 東西真的落地」第二次，兩次都是實彈才照出來。
+    convOffset: ctx.convOffset ?? null,
+    convOverlap: ctx.convOverlap ?? null,
     // ③ 系統提示走第一則的那幾發才落：sysFirst＋兩個快取點座標（三塊那發 s1 是 null）。關閉時**沒有這幾個鍵**。
     ...(ctx.splitSysFirst ? { sysFirst: true, s1: ctx.splitS1 ?? null, s2: ctx.splitS2 ?? null } : {}),
     // 26-09-02 組成表彙總（CX-260902-01）：系統區／對話／注入各多少則多少字元、跟上一發幾則變幾則移位。
@@ -1098,6 +1104,10 @@ let pendingTurnKey = null;
 // 「一樣長還是連長度都變了」，而那正是綾那個形狀的分水嶺（見 lengthsOfTurns 註解）。
 let prevTurnLens = null;
 let pendingTurnLens = null;
+// 26-09-04（CX-260904-01 ①）：基準再多存一份「每一則是什麼」（sys／dlg／inj）。
+// 重疊率對齊只看對話則，而分類要有 messages＋headerEnd 才算得出來——下一發手上只剩基準，重算不了。
+let prevTurnKinds = null;
+let pendingTurnKinds = null;
 
 // ── 看過的鑰匙（26-09-03，CX-260903-01 ①）────────────────────────────
 //
@@ -1108,7 +1118,7 @@ let pendingTurnLens = null;
 // 上限 8、LRU、只在記憶體不落檔：這是診斷用的短期記憶，不是使用者資料。
 // 一個服務進程通常就服務一位使用者的幾個聊天，8 把夠用；無上限會讓長時間開著的酒館越吃越多記憶體。
 const KEY_MEMORY_MAX = 8;
-const keyMemory = [];   // [{ key, fps, lens, snap }]，最近用過的排最後
+const keyMemory = [];   // [{ key, fps, lens, kinds, snap }]，最近用過的排最後
 
 // **只有 `u:` 形狀的鑰匙進得了記憶**（26-09-03）。那把綁的是玩家真的打進去的第一句話，有識別力；
 // 其餘三種退路形狀（`fp0`＝只有開場白、`fp0.fp1`＝對話流沒有 user、`s:`＝連對話流都沒有）
@@ -1126,11 +1136,11 @@ function recallBaseline(key) {
   }
   return null;
 }
-function rememberBaseline(key, fps, lens, snap) {
+function rememberBaseline(key, fps, lens, kinds, snap) {
   if (!有識別力(key) || !fps) return;
   const at = keyMemory.findIndex(e => e.key === key);
   if (at >= 0) keyMemory.splice(at, 1);
-  keyMemory.push({ key, fps, lens, snap });
+  keyMemory.push({ key, fps, lens, kinds, snap });
   while (keyMemory.length > KEY_MEMORY_MAX) keyMemory.shift();
 }
 /** 測試用：現在記得哪幾把鑰匙（只回 key，不回基準內容）。 */
@@ -1189,9 +1199,11 @@ export function evaluateBreakpoint(messages, headerEnd, convKey) {
   // 指紋先算——下面「開場白單則長成雙則」那條要拿內容驗，不能只看 key 的形狀（26-09-03）
   pendingTurnFps = fingerprintTurns(messages);
   pendingTurnLens = lengthsOfTurns(messages);
+  pendingTurnKinds = kindsOfTurns(messages, headerEnd);
   const sameAsPrev = convKey === undefined || sameConversation(prevTurnKey, convKey);
   let baseFps = sameAsPrev ? prevTurnFps : null;
   let baseLens = sameAsPrev ? prevTurnLens : null;
+  let baseKinds = sameAsPrev ? prevTurnKinds : null;
   let baseSnap = sameAsPrev ? prevRewriteSnap : null;
   // 26-09-03（CX-260903-01 ①）：上一發不是同一個對話，就去翻「看過的鑰匙」——
   // 綾 n=3 拿到的 key 跟 n=1 一模一樣，那一發本來就該有基準可比（見 keyMemory 註解）。
@@ -1199,31 +1211,68 @@ export function evaluateBreakpoint(messages, headerEnd, convKey) {
   if (!sameAsPrev) {
     const hit = recallBaseline(convKey);
     if (hit) {
-      baseFps = hit.fps; baseLens = hit.lens; baseSnap = hit.snap;
+      baseFps = hit.fps; baseLens = hit.lens; baseKinds = hit.kinds; baseSnap = hit.snap;
       baseSource = 'recall';
     } else if (grewFromGreeting(prevTurnKey, prevTurnFps, pendingTurnFps, headerEnd)) {
       // 「新聊天只有開場白」→「玩家送出第一句」：key 從單則形狀（`fp0`）換成 `u:` 形狀，
       // 兩把字面上對不起來。26-09-02 靠 key 的前綴關係放行，換錨後那條前綴不存在了——
       // 改用**內容**驗，而且比舊法嚴：上一發的指紋整串要是這一發的前綴（純追加）才算同一個聊天。
-      baseFps = prevTurnFps; baseLens = prevTurnLens; baseSnap = prevRewriteSnap;
+      baseFps = prevTurnFps; baseLens = prevTurnLens; baseKinds = prevTurnKinds; baseSnap = prevRewriteSnap;
       baseSource = 'grew';
     }
   }
-  // 「真的換了對話」＝上一發不是它、記憶裡也沒有它。取回基準的那種不算換——sticky 與雜湊歷史都該留著。
-  const keyChanged = !sameAsPrev && baseSource === 'none';
+
+  // ── 重疊率仲裁（26-09-04，CX-260904-01 ①）───────────────────────────
+  //
+  // 三代的錨（系統提示雜湊／對話流開頭兩則／第一則 user）全長在對話流內容裡，而**位移的定義
+  // 就是第一則換人**——凌敘 26-09-04 兩發間隔 14 分鐘、系統區一個位元都沒動，convKey 照樣換掉、
+  // 基準照樣丟。而且位移讓鑰匙**單調變化、永不重複**，1.9.3 記 8 把鑰匙的快路徑對這型完全無效。
+  //
+  // 所以判準改成內容自己說話：逐則指紋做偏移對齊，最長連續吻合佔上一發對話則數 ≥ 門檻就沿用基準。
+  // key 退成**快路徑＋診斷欄位**（cache-log 照舊落，凌敘在看那格），重疊率是最終仲裁：
+  //   ① key 判換對話、記憶也翻不到 → 重疊率夠高就把上一發的基準救回來（baseSource='overlap'）
+  //   ② key 放行、但重疊率低到過不了門檻 → **丟基準**。那是「同卡、玩家第一句一字不差的兩個聊天」
+  //      那型（1.9.3 明知而接受的代價），內容擺在眼前說不是同一個對話，就不准拿它當基準。
+  //      寧可誤判成換對話（代價：一發沒省到），也絕不拿別的對話當基準——26-08-28 修掉的那道門不准重開。
+  // 量不到（兩邊至少一邊沒有對話則）就兩個方向都不表態，不拿量不到的東西當證據。
+  let overlap = baseFps
+    ? alignDialogue(baseFps, baseKinds, pendingTurnFps, pendingTurnKinds)
+    : (prevTurnFps ? alignDialogue(prevTurnFps, prevTurnKinds, pendingTurnFps, pendingTurnKinds) : null);
+  const 過門檻 = o => !!o && o.measurable && o.run >= CONV_OVERLAP_MIN_RUN && o.ratio >= CONV_OVERLAP_MIN_RATIO;
+  if (!baseFps && 過門檻(overlap)) {
+    baseFps = prevTurnFps; baseLens = prevTurnLens; baseKinds = prevTurnKinds; baseSnap = prevRewriteSnap;
+    baseSource = 'overlap';
+  } else if (baseFps && overlap && overlap.measurable && overlap.ratio < CONV_OVERLAP_MIN_RATIO) {
+    baseFps = null; baseLens = null; baseKinds = null; baseSnap = null;
+    baseSource = 'none';
+  }
+  // 位移量：有基準才有意義（沒基準＝沒有東西可以對齊，落 null 而不是 0——0 是「量過、沒位移」）
+  const convOffset = baseFps ? (overlap && overlap.measurable && overlap.offset != null ? overlap.offset : 0) : null;
+
+  // 「真的換了對話」＝上一發不是它、記憶裡也沒有它、重疊率也救不回來。取回基準的那種不算換——sticky 與雜湊歷史都該留著。
+  const keyChanged = baseSource === 'none';
   // 26-09-02（審核 C5）：換對話時 sticky 斷點與雜湊歷史也要歸零——放暫存，成功才提交。
   // sticky 不清：新對話黏在舊對話的第 N 則上，held 期間少納一截進穩定塊，要再玩到 gain≥40 才跳。
   // systemHashSeen 不清：A→B→A 切回來被判 recurring「來回切換」，其實只是換了聊天。
   // systemHash **保留**——換對話後第一發報一次「系統提示變了」是真的，該報。
+  // 26-09-04（CX-260904-01 ③）：**位移量要套到 sticky 上**。sticky 記的是上一發的索引位置，
+  // 位移之後那個索引指到別的訊息去了——不修的話，斷點會黏在一則「剛好排在那個號碼上的別人」，
+  // 而症狀跟「拆塊沒生效」在讀數上完全同形。修完落進 header 就當失效（回退現行邏輯＝下一發重立）。
+  const 修位移 = (v) => {
+    if (v == null || !convOffset) return v ?? null;
+    const n = v - convOffset;
+    return n >= headerEnd && n > 0 ? n : null;
+  };
   pendingSplit = {
-    sticky: keyChanged ? null : splitState.sticky,
-    sticky1: keyChanged ? null : (splitState.sticky1 ?? null),
+    sticky: keyChanged ? null : 修位移(splitState.sticky),
+    sticky1: keyChanged ? null : 修位移(splitState.sticky1 ?? null),
     systemHash: splitState.systemHash,
     systemHashSeen: keyChanged ? [] : [...(splitState.systemHashSeen || [])],
   };
   // 算好先放著，**等請求真的成功再由 commitTurnBaseline() 提交**（見 pendingTurnFps 註解）
   pendingTurnFps = fingerprintTurns(messages);
   pendingTurnLens = lengthsOfTurns(messages);
+  pendingTurnKinds = kindsOfTurns(messages, headerEnd);
   pendingTurnKey = convKey !== undefined ? convKey : prevTurnKey;
   // 26-09-02（CX-260902-03）：**header 內的變動不計入斷點的分歧點**。
   // 斷點切的是對話流（header 那段已進 systemPrompt，不在拆塊範圍）；系統提示變了整包前綴作廢是另一層的事，
@@ -1276,7 +1325,9 @@ export function evaluateBreakpoint(messages, headerEnd, convKey) {
   // convKey 一起回：cache-log／turn-log 每筆落一格，事後看得出「有沒有換鑰匙」（CX-260902-03 ⑤）
   // prevLens／baseSource 是 26-09-03 加的：前者給 composeTurns 算 sameLenDiffContent，
   // 後者讓落檔看得出這一發的基準是「上一發」「翻記憶翻回來的」還是「根本沒有」。
-  return { decision, prevFps, prevLens: baseLens, baseSource, fps: pendingTurnFps, shift, rewriteDiff, rewriteFull, convKey: pendingTurnKey };
+  // offset／overlap 是 26-09-04 加的（CX-260904-01 ①②）：前者給 composeTurns 落 comp.dlg.offset、
+  // 也給 sticky 做位置修正；後者整包留著給診斷（run／ratio／掃描表），事後看得出「憑什麼判同一個對話」。
+  return { decision, prevFps, prevLens: baseLens, baseSource, fps: pendingTurnFps, shift, rewriteDiff, rewriteFull, convKey: pendingTurnKey, offset: convOffset, overlap };
 }
 
 // ── 系統區連續漂移的計數（26-09-03，CX-260903-01 ③）──────────────────
@@ -1314,10 +1365,11 @@ export function commitTurnBaseline() {
   if (!pendingTurnFps) return false;
   prevTurnFps = pendingTurnFps;
   prevTurnLens = pendingTurnLens;
+  prevTurnKinds = pendingTurnKinds;
   prevTurnKey = pendingTurnKey;
   prevRewriteSnap = pendingRewriteSnap;
   // 這一發成功了 → 這把鑰匙配這份基準，記進「看過的鑰匙」（26-09-03 ①）
-  rememberBaseline(prevTurnKey, prevTurnFps, prevTurnLens, prevRewriteSnap);
+  rememberBaseline(prevTurnKey, prevTurnFps, prevTurnLens, prevTurnKinds, prevRewriteSnap);
   if (pendingSysDrift) {
     sysDriftStreak = pendingSysDrift.streak;
     sysDriftIdx = pendingSysDrift.idx;
@@ -1334,6 +1386,7 @@ export function commitTurnBaseline() {
   pendingRewriteSnap = null;
   pendingTurnFps = null;
   pendingTurnLens = null;
+  pendingTurnKinds = null;
   return true;
 }
 
@@ -1391,9 +1444,11 @@ export function __resetTurnBaseline() {
   prevTurnFps = null;
   prevTurnKey = null;
   prevTurnLens = null;
+  prevTurnKinds = null;
   pendingTurnFps = null;
   pendingTurnKey = null;
   pendingTurnLens = null;
+  pendingTurnKinds = null;
   keyMemory.length = 0;
   sysDriftStreak = 0;
   sysDriftIdx = null;
@@ -1480,8 +1535,8 @@ function traceTurns(messages, headerEnd, reqNo, evaluated, splitInfo, compIn) {
   // （cache-log 的 rewriteDiff——前後各 24 字＋前後文 36 字——是另一條線，預設就落，不歸這段管。）
   const trace = traceEnabled();   // 26-09-02 ⑨：面板 /config 的 trace 欄或環境變數，兩者其一
   try {
-    const { decision, prevFps, prevLens, fps } = evaluated || evaluateBreakpoint(messages, headerEnd);
-    const comp = compIn || composeTurns(messages, headerEnd, prevFps, { fps, prevLens });
+    const { decision, prevFps, prevLens, fps, offset } = evaluated || evaluateBreakpoint(messages, headerEnd);
+    const comp = compIn || composeTurns(messages, headerEnd, prevFps, { fps, prevLens, offset });
     const entry = {
       t: new Date().toISOString(),
       n: reqNo,
@@ -1919,7 +1974,11 @@ export function usageCtx(base, { mode, aborted = false, suffix = aborted ? ' (�
     sysRecurring: systemDrift.recurring,
     comp: comp.summary,   // 26-09-02 組成表彙總（CX-260902-01）
     convKey: evaluated?.convKey ?? null,   // 26-09-02 對話識別（CX-260902-03 ⑤）：事後看有沒有換鑰匙
-    convBase: evaluated?.baseSource ?? null,   // 26-09-03 ①：基準從哪來（prev／recall／none）
+    convBase: evaluated?.baseSource ?? null,   // 26-09-03 ①：基準從哪來（prev／recall／grew／overlap／none）
+    // 26-09-04 ②（CX-260904-01）：位移量與憑什麼判同一個對話。comp.dlg.offset 已有同一個數字，
+    // 這裡再開一格平的——凌敘讀的是 cache-log 的欄位，位移量藏在 comp 裡他得多剝一層。
+    convOffset: evaluated?.offset ?? null,
+    convOverlap: evaluated?.overlap ? { run: evaluated.overlap.run, ratio: Number(evaluated.overlap.ratio.toFixed(3)), prevN: evaluated.overlap.prevN } : null,
     sysDriftStreak: base.sysDriftStreak ?? null,
     sysDriftAdvice: base.sysDriftAdvice ?? null,
   };
@@ -2062,7 +2121,7 @@ async function handleChatCompletions(req, res) {
     // 彙總進 cache-log 與面板，逐則進 turn-log（traceTurns）。指紋沿用 evaluated 算好的，不重算。
     // 為什麼要它：一位使用者的「擴充功能 7,074 token」在酒館面板只有總數、內建子項全是 0——
     // 那七千來自第三方擴充的注入，只存在於送出的那一刻，檔案裡看不到，只有這裡看得到。
-    const comp = composeTurns(messages, headerEnd, evaluated.prevFps, { fps: evaluated.fps, prevLens: evaluated.prevLens });
+    const comp = composeTurns(messages, headerEnd, evaluated.prevFps, { fps: evaluated.fps, prevLens: evaluated.prevLens, offset: evaluated.offset });
     // 26-09-03（CX-260903-01 ③）：系統區連續漂了幾發、是哪幾則。連續 ≥3 發才開口，
     // 而且**只由實測到的漂移觸發**——「系統區有幾條綠燈」這類靜態特徵推論不出漂移（見 sysDriftAdvice 的守門註解）。
     const sysStreak = trackSysDriftStreakPending(comp.summary.sys, evaluated.baseSource !== 'none');

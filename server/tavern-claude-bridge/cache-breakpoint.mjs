@@ -714,6 +714,97 @@ export function kindOfTurn(msg, i, headerEnd = 0) {
 }
 
 /**
+ * 整串訊息的分類陣列（26-09-04，CX-260904-01）。基準要跟指紋、長度一起存這一份——
+ * 重疊率對齊只看**對話則**（kind='dlg'），而分類算得出來的前提是拿得到 messages 與 headerEnd，
+ * 下一發手上只剩基準，重算不了。
+ */
+export function kindsOfTurns(messages, headerEnd = 0) {
+  return (messages || []).map((m, i) => kindOfTurn(m, i, headerEnd));
+}
+
+// ── 重疊率（26-09-04，CX-260904-01｜凌敘的視窗位移）──────────────────
+//
+// 為什麼要換掉「錨」這套：1.9.1 綁系統提示雜湊、1.9.2 綁對話流開頭兩則、1.9.3 綁第一則 user 訊息——
+// 三個錨全長在對話流內容裡，而**位移的定義就是第一則換人**。酒館的
+// `tokenBudget = openai_max_context − openai_max_tokens`（public/scripts/openai.js:3887-3893）
+// 一旦不夠裝，每發從最舊的一頭砍掉一組 user+assistant；於是鑰匙**單調變化、永不重複**，
+// 1.9.3 那個「記住最近 8 把鑰匙」的假設（鑰匙會在少數幾把之間來回跳）整個不成立——記 80 把也對不上。
+//
+// 改用內容自己說話：兩發的逐則指紋做偏移對齊，看**最長連續吻合**佔上一發對話則數多少。
+// 為什麼是「最長連續」不是「集合交集」：交集會被「同一張卡的兩個不同聊天」騙——
+// 那兩個聊天的開場白、常駐條目都一樣，交集看起來很大，但它們接不成一條連續的線。
+//
+// 為什麼只拿 kind='dlg' 對齊（規格沒寫的判斷，理由記在這）：注入層跟對話層**位移量不同**。
+// 綾的形狀是對話尾端追加兩則、47 則注入層整層往後挪 2 格——拿整條對話流去對齊，
+// 注入層那 47 則會用 offset=−2 贏過對話層那 19 則，算出來的位移量是注入層的，
+// 而 sticky 要修的是斷點（在對話層）。offset 落錯號比不修更糟。
+export const CONV_OVERLAP_MIN_RATIO = 0.5;   // 最長連續吻合 / 上一發對話則數，過這條才算同一個對話
+export const CONV_OVERLAP_MIN_RUN = 2;       // 絕對下限：只吻合 1 則（同卡共用的開場白）不准算同一個對話
+export const CONV_OVERLAP_MAX_OFFSET = 12;   // 偏移搜尋半徑上限（實測位移多在 1–4 格）
+
+/** 偏移搜尋順序：0、1、−1、2、−2 …… 先近後遠、同分時偏向不位移。 */
+function* offsetOrder(n) {
+  yield 0;
+  for (let k = 1; k <= n; k++) { yield k; yield -k; }
+}
+
+/**
+ * 兩發的**對話則**做偏移對齊，回最佳位移與重疊率。
+ *
+ * @param {string[]|null} prevFps   上一發的逐則指紋
+ * @param {string[]|null} prevKinds 上一發的逐則分類（kindsOfTurns 的結果，跟基準一起存）
+ * @param {string[]} curFps         這一發的逐則指紋
+ * @param {string[]} curKinds       這一發的逐則分類
+ * @returns {{measurable:boolean, offset:number|null, dlgOffset:number|null, run:number, ratio:number,
+ *            prevN:number, curN:number, scan:{offset:number,run:number}[]}}
+ *   offset＝**messages 座標**的位移量：正數＝這一發從最舊的一頭砍掉幾則（上一發的第 p 則＝這一發的第 p−offset 則）。
+ *   dlgOffset＝同一件事的「對話則序號」座標（診斷用）。measurable=false＝兩邊至少一邊沒有對話則，
+ *   這種情況**兩個方向都不表態**（不救援也不否決），不拿量不到的東西當證據。
+ */
+export function alignDialogue(prevFps, prevKinds, curFps, curKinds, opts = {}) {
+  const { maxOffset = CONV_OVERLAP_MAX_OFFSET } = opts;
+  const none = { measurable: false, offset: null, dlgOffset: null, run: 0, ratio: 0, prevN: 0, curN: 0, scan: [] };
+  if (![prevFps, prevKinds, curFps, curKinds].every(Array.isArray)) return none;
+  const pick = (fps, kinds) => {
+    const out = [];
+    for (let i = 0; i < fps.length && i < kinds.length; i++) if (kinds[i] === 'dlg') out.push({ i, f: fps[i] });
+    return out;
+  };
+  const P = pick(prevFps, prevKinds), C = pick(curFps, curKinds);
+  if (!P.length || !C.length) return none;
+
+  const scan = [];
+  let best = { offset: 0, run: 0, at: -1 };
+  for (const o of offsetOrder(Math.min(P.length, maxOffset))) {
+    let run = 0, cur = 0, at = -1, start = -1;
+    for (let k = 0; k < C.length; k++) {
+      const p = k + o;
+      if (p < 0 || p >= P.length) { cur = 0; start = -1; continue; }
+      if (C[k].f === P[p].f) {
+        if (cur === 0) start = k;
+        cur++;
+        if (cur > run) { run = cur; at = start; }
+      } else { cur = 0; start = -1; }
+    }
+    scan.push({ offset: o, run });
+    if (run > best.run) best = { offset: o, run, at };
+  }
+  // 位移量換算回 messages 座標：最佳連續段第一對的索引差。**不是直接用 dlgOffset**——
+  // 對話則之間可能夾著注入則，序號差與索引差不是同一個數。
+  const offset = best.run > 0 && best.at >= 0 ? P[best.at + best.offset].i - C[best.at].i : null;
+  return {
+    measurable: true,
+    offset,
+    dlgOffset: best.run > 0 ? best.offset : null,
+    run: best.run,
+    ratio: best.run / P.length,
+    prevN: P.length,
+    curN: C.length,
+    scan,
+  };
+}
+
+/**
  * 組成表：每一則 { i, role, kind, len, vs, prevIndex } ＋彙總＋這一發的指紋。
  *
  * vs：same（同位同內容）／moved（內容同、位置變，prevIndex 是上一發的位置）／new（上一發沒有：新的或改過）
@@ -725,9 +816,10 @@ export function kindOfTurn(msg, i, headerEnd = 0) {
  * @param {number} headerEnd   系統區止於第幾則（parseMessages 算的，這裡不重算——判準只能有一份）
  * @param {string[]|null} prevFps 上一發的指紋陣列（fingerprintTurns 的結果）；沒有就 null
  * @param {object} opts fps＝這一發算好的指紋（不重算）；prevLens＝上一發的長度陣列（lengthsOfTurns），
- *                      有給才算得出 sameLenDiffContent（26-09-03 ②）
+ *                      有給才算得出 sameLenDiffContent（26-09-03 ②）；
+ *                      offset＝這一發相對基準的位移量（alignDialogue 量的），落進 summary.dlg.offset（26-09-04 ②）
  */
-export function composeTurns(messages, headerEnd = 0, prevFps = null, { fps: fpsIn, prevLens = null } = {}) {
+export function composeTurns(messages, headerEnd = 0, prevFps = null, { fps: fpsIn, prevLens = null, offset = null } = {}) {
   const msgs = Array.isArray(messages) ? messages : [];
   // 呼叫端已算過這一發的指紋（evaluateBreakpoint）就直接用——每發兩次全量 sha1 是浪費
   const fps = Array.isArray(fpsIn) && fpsIn.length === msgs.length ? fpsIn : fingerprintTurns(msgs);
@@ -777,6 +869,12 @@ export function composeTurns(messages, headerEnd = 0, prevFps = null, { fps: fps
     inj: agg('inj', true),
     gone: hasPrev ? prevFps.length - used.size : null,
   };
+
+  // 位移量（26-09-04 ②，CX-260904-01）：正數＝這一發從最舊的一頭砍掉幾則；0＝沒位移；null＝沒有基準可比。
+  // 為什麼要露這一格：凌敘 26-09-04 是自己拿兩發的 turns 做偏移對齊才量出「往前滾 2 格」的——
+  // 那件事橋自己就知道，卻沒寫進任何一格，於是使用者只看得到「convKey 換了、convBase=none」，
+  // 長得跟「換聊天」一模一樣。診斷不講位移量，人就會去查一個沒動過的系統區。
+  summary.dlg.offset = hasPrev && typeof offset === 'number' ? offset : null;
 
   // 系統區的兩格細節（26-09-03，CX-260903-01 ②）。只放 sys——那是「一變整包快取全毀」的那一段，
   // 也是綾唯一需要指名道姓的地方；注入區跟著對話走，逐則指名沒有可操作性。
