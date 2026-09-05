@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 // 拆塊斷點掃描器（26-08-02，CX-260802-03）：只做「斷點該落在哪一則」的計算，
 // 不碰渲染也不貼標記——分工線在那支的檔頭註解。目前只被量測模式用到。
-import { fingerprintTurns, lengthsOfTurns, kindsOfTurns, alignDialogue, CONV_OVERLAP_MIN_RATIO, CONV_OVERLAP_MIN_RUN, decideBreakpoint, stickyBreakpoint, meetsCacheMinimum, estimateTokens, minCacheTokensFor, trackSystemPrompt, analyzeShift, cacheRoi, shortDiff, textOfTurn, composeTurns, composeLine, kindOfTurn, sysDriftAdvice } from './cache-breakpoint.mjs';
+import { fingerprintTurns, lengthsOfTurns, kindsOfTurns, alignDialogue, CONV_OVERLAP_MIN_RATIO, CONV_OVERLAP_MIN_RUN, CONV_OVERLAP_STRONG_RUN, decideBreakpoint, stickyBreakpoint, meetsCacheMinimum, estimateTokens, minCacheTokensFor, trackSystemPrompt, analyzeShift, cacheRoi, shortDiff, textOfTurn, composeTurns, composeLine, kindOfTurn, sysDriftAdvice } from './cache-breakpoint.mjs';
 
 // ESM 沒有 __dirname，自己算（快取讀數落檔要用——見 appendCacheLog）
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -833,6 +833,12 @@ function recordUsage(usage, ctx) {
     // 同族的坑：這一版的「碼跑起來 ≠ 東西真的落地」第二次，兩次都是實彈才照出來。
     convOffset: ctx.convOffset ?? null,
     convOverlap: ctx.convOverlap ?? null,
+    // 26-09-05：拆塊這一發到底做了什麼。原本只有 sysFirst 模式才落幾格座標，
+    // 一般模式的 cache-log 完全看不出「有沒有套用、切在第幾則、沒套用是為什麼」——
+    // 於是讀 log 的人（含我自己）分不出快取是斷點換來的還是 SDK 自己那筆。只多記錄、不改行為。
+    splitApplied: ctx.splitApplied ?? null,
+    splitCut: ctx.splitCut ?? null,
+    splitReason: ctx.splitReason ?? null,
     // ③ 系統提示走第一則的那幾發才落：sysFirst＋兩個快取點座標（三塊那發 s1 是 null）。關閉時**沒有這幾個鍵**。
     ...(ctx.splitSysFirst ? { sysFirst: true, s1: ctx.splitS1 ?? null, s2: ctx.splitS2 ?? null } : {}),
     // 26-09-02 組成表彙總（CX-260902-01）：系統區／對話／注入各多少則多少字元、跟上一發幾則變幾則移位。
@@ -1238,11 +1244,18 @@ export function evaluateBreakpoint(messages, headerEnd, convKey) {
   let overlap = baseFps
     ? alignDialogue(baseFps, baseKinds, pendingTurnFps, pendingTurnKinds)
     : (prevTurnFps ? alignDialogue(prevTurnFps, prevTurnKinds, pendingTurnFps, pendingTurnKinds) : null);
-  const 過門檻 = o => !!o && o.measurable && o.run >= CONV_OVERLAP_MIN_RUN && o.ratio >= CONV_OVERLAP_MIN_RATIO;
+  // 26-09-05（CX-260905-02 ②）：判準加一條**絕對值**——連續吻合 ≥ CONV_OVERLAP_STRONG_RUN(8) 則
+  // 直接算同一個對話，與 ratio 門檻是 OR。理由在常數旁邊（綾的 prevN 在 17／21 之間跳，分母不穩，
+  // run=10 這種很強的證據會被 ratio=0.476 擋掉）。CONV_OVERLAP_MIN_RUN 那道最低門檻照舊擋在最前面，
+  // 26-08-28 那道門一格都沒放寬——run=1／run=0 仍然是換對話。
+  const 強連續 = o => !!o && o.measurable && o.run >= CONV_OVERLAP_STRONG_RUN;
+  const 過門檻 = o => !!o && o.measurable && o.run >= CONV_OVERLAP_MIN_RUN
+    && (o.ratio >= CONV_OVERLAP_MIN_RATIO || 強連續(o));
   if (!baseFps && 過門檻(overlap)) {
     baseFps = prevTurnFps; baseLens = prevTurnLens; baseKinds = prevTurnKinds; baseSnap = prevRewriteSnap;
-    baseSource = 'overlap';
-  } else if (baseFps && overlap && overlap.measurable && overlap.ratio < CONV_OVERLAP_MIN_RATIO) {
+    // 診斷要分得出憑哪一條認出來的：只有 run 過的落 'overlap-run'，事後看得出這一發是被新判準救回來的。
+    baseSource = overlap.ratio >= CONV_OVERLAP_MIN_RATIO ? 'overlap' : 'overlap-run';
+  } else if (baseFps && overlap && overlap.measurable && overlap.ratio < CONV_OVERLAP_MIN_RATIO && !強連續(overlap)) {
     baseFps = null; baseLens = null; baseKinds = null; baseSnap = null;
     baseSource = 'none';
   }
@@ -1330,19 +1343,36 @@ export function evaluateBreakpoint(messages, headerEnd, convKey) {
   return { decision, prevFps, prevLens: baseLens, baseSource, fps: pendingTurnFps, shift, rewriteDiff, rewriteFull, convKey: pendingTurnKey, offset: convOffset, overlap };
 }
 
-// ── 系統區連續漂移的計數（26-09-03，CX-260903-01 ③）──────────────────
+// ── 系統區連續漂移的計數（26-09-03，CX-260903-01 ③；26-09-05 修空窗，CX-260905-02 ①）──
 //
 // 「連續幾發 changed 非空」——一發沒漂就歸零。跟指紋基準同一條紀律：**成功才提交**，
 // 失敗的請求（額度不足、斷線）不該把 streak 往上推，不然使用者重刷兩次就被指認一次。
+//
+// 26-09-05（綾實測 v1.9.4 抓到）：**沒有基準時 changed 是 null，不是 0**。
+// 舊碼把 null 當成「這一發沒漂」→ 歸零。綾的判詞：
+//   **「基準丟了跟系統提示沒漂是兩件事，現在混在同一個計數器裡。」**
+// 她 15:19 那四發 base=none／overlap／none／overlap，兩發沒基準把 streak 砍成 0，
+// 建議句永遠攢不到 3、出不來——而她的系統區其實每一發都在漂。
+// 正確語意：沒有基準＝這一發**不知道**有沒有漂 → streak 原地不動（不累加也不歸零），
+// 連 idx 名單一起留著（沖掉名單等於下一發重新數，白等）。歸零留給兩種真的知道的情況：
+//   ① 有基準、changed 真的是空——真的沒漂；
+//   ② convSwitched——拿得出「這是另一個對話」的證據（見呼叫端：重疊率量得到卻連一小段都對不上）。
 let sysDriftStreak = 0;
 let sysDriftIdx = null;
 let pendingSysDrift = null;
 /**
  * @param {object} sysSummary comp.summary.sys（要有 changedIdx）
  * @param {boolean} sameConv  這一發跟基準是不是同一個對話（換對話就重新數）
+ * @param {boolean} convSwitched 有證據說「這是另一個對話」——沒基準時唯一准歸零的理由（26-09-05 ①）
  */
-export function trackSysDriftStreakPending(sysSummary, sameConv) {
+export function trackSysDriftStreakPending(sysSummary, sameConv, convSwitched = false) {
   const changedIdx = Array.isArray(sysSummary?.changedIdx) ? sysSummary.changedIdx : null;
+  // 空窗（沒基準，量不出 changed）：換對話才歸零，其餘原地保持——不知道的事不准當成「沒漂」。
+  if (!changedIdx) {
+    const 空窗 = convSwitched ? { streak: 0, idx: null } : { streak: sysDriftStreak, idx: sysDriftIdx };
+    pendingSysDrift = 空窗;
+    return 空窗;
+  }
   const baseStreak = sameConv ? sysDriftStreak : 0;
   const baseIdx = sameConv ? sysDriftIdx : null;
   let streak = 0, idx = null;
@@ -1956,6 +1986,9 @@ export function usageCtx(base, { mode, aborted = false, suffix = aborted ? ' (�
     // 26-09-02（審核 A4）：帳上要看得出這發被打斷（console 後綴＋cache-log 的 aborted），兩條路都帶
     aborted, suffix,
     splitApplied: splitInfo.applied,
+    // 26-09-05：切點座標也帶上。查「這筆讀取是我們釘的斷點換來的、還是 SDK 自己那個快取點」時，
+    // cache-log 裡看不到 applied／cut 就分辨不了——我自己查吟雪那題時撞到，而外部工程師讀的就是這個檔。
+    splitCut: splitInfo.cut ?? null,
     splitReason: splitInfo.reason,
     splitDivergence: splitInfo.divergence ?? null,
     splitZone: splitInfo.zone ?? null,
@@ -1974,7 +2007,9 @@ export function usageCtx(base, { mode, aborted = false, suffix = aborted ? ' (�
     sysRecurring: systemDrift.recurring,
     comp: comp.summary,   // 26-09-02 組成表彙總（CX-260902-01）
     convKey: evaluated?.convKey ?? null,   // 26-09-02 對話識別（CX-260902-03 ⑤）：事後看有沒有換鑰匙
-    convBase: evaluated?.baseSource ?? null,   // 26-09-03 ①：基準從哪來（prev／recall／grew／overlap／none）
+    // 26-09-03 ①：基準從哪來（prev／recall／grew／overlap／overlap-run／none）
+    // overlap-run 是 26-09-05 加的（CX-260905-02 ②）：ratio 沒過、靠連續吻合 ≥8 則救回來的那型。
+    convBase: evaluated?.baseSource ?? null,
     // 26-09-04 ②（CX-260904-01）：位移量與憑什麼判同一個對話。comp.dlg.offset 已有同一個數字，
     // 這裡再開一格平的——凌敘讀的是 cache-log 的欄位，位移量藏在 comp 裡他得多剝一層。
     convOffset: evaluated?.offset ?? null,
@@ -2124,7 +2159,12 @@ async function handleChatCompletions(req, res) {
     const comp = composeTurns(messages, headerEnd, evaluated.prevFps, { fps: evaluated.fps, prevLens: evaluated.prevLens, offset: evaluated.offset });
     // 26-09-03（CX-260903-01 ③）：系統區連續漂了幾發、是哪幾則。連續 ≥3 發才開口，
     // 而且**只由實測到的漂移觸發**——「系統區有幾條綠燈」這類靜態特徵推論不出漂移（見 sysDriftAdvice 的守門註解）。
-    const sysStreak = trackSysDriftStreakPending(comp.summary.sys, evaluated.baseSource !== 'none');
+    // 26-09-05（CX-260905-02 ①）：沒基準時「這到底是不是另一個對話」的證據就一格——重疊率。
+    // 量得到、卻連 CONV_OVERLAP_MIN_RUN 那一小段都對不上 → 真的換聊天了，計數器從頭數。
+    // 量不到（第一發、沒有對話則）或對得上一截卻沒過門檻（綾的 run=10 那型）→ **不知道**，不動計數器。
+    const 換了對話 = evaluated.baseSource === 'none' && !!evaluated.overlap
+      && evaluated.overlap.measurable && evaluated.overlap.run < CONV_OVERLAP_MIN_RUN;
+    const sysStreak = trackSysDriftStreakPending(comp.summary.sys, evaluated.baseSource !== 'none', 換了對話);
     comp.summary.sys.driftStreak = sysStreak.streak;
     const 漂移建議 = sysDriftAdvice(sysStreak.streak, sysStreak.idx);
     if (漂移建議) console.warn(`[${PLUGIN_ID}] 第 ${requestCount + 1} 發：${漂移建議}`);
