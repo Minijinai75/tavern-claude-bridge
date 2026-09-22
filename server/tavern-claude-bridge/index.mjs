@@ -325,6 +325,8 @@ function applyConfig(cfg) {
 }
 
 const MODELS = [
+  { id: 'claude-opus-5-5[1m]', object: 'model', owned_by: 'anthropic' },   // 26-09-23 上線隔天 Mini 點名加（要 SDK 0.3.280＝CLI 2.1.280 起才收）
+  { id: 'claude-opus-5-5', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-opus-5[1m]', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-opus-5', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-opus-4-6[1m]', object: 'model', owned_by: 'anthropic' },

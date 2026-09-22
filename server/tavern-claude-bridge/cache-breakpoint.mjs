@@ -135,6 +135,7 @@ export const PRICE_PER_MTOK = {
 export const PRICE_TABLE = [
   { match: 'claude-fable-5-1',  input: 10, output: 50, writeMul: 2, readMul: 0.025 },
   { match: 'claude-fable-5',    input: 10, output: 50, writeMul: 2, readMul: 0.1 },
+  { match: 'claude-opus-5-5',   input: 4,  output: 20, writeMul: 2, readMul: 0.05 },  // 26-09-23：讀 $0.20/MTok；必須排在 opus-5 前面，不然前綴比對會把它算成 Opus 5
   { match: 'claude-opus-5',     input: 5,  output: 25, writeMul: 2, readMul: 0.1 },
   { match: 'claude-opus-4-8',   input: 5,  output: 25, writeMul: 2, readMul: 0.1 },
   { match: 'claude-opus-4-7',   input: 5,  output: 25, writeMul: 2, readMul: 0.1 },
@@ -524,6 +525,7 @@ export function splitFlow(flow, cut) {
  * 模型改版時這張表要跟著更新；查不到的一律走表中最大值，不走寬鬆值。
  */
 export const CACHE_MIN_TOKENS = {
+  'claude-opus-5-5': 512,   // 26-09-23：官方門檻表尚未列 Opus 5.5，同 Opus 5 tokenizer 家族比照；查到不同數字要改
   'claude-opus-5': 512,
   'claude-fable-5-1': 512,   // 26-09-02：同 Fable 5 家族，未另查到不同數字
   'claude-fable-5': 512,
@@ -588,6 +590,7 @@ export const CJK_TOKENS_PER_CHAR = {
   // 新 tokenizer（Opus 4.7 起）——實際 token 更多（1×～1.35×），1.0 仍是下界；沒查到 CJK 每字數字，先不往上填
   'claude-opus-4-7': 1.0,
   'claude-opus-4-8': 1.0,
+  'claude-opus-5-5': 1.0,
   'claude-opus-5': 1.0,
   'claude-sonnet-5': 1.0,
   'claude-fable-5-1': 1.0,
