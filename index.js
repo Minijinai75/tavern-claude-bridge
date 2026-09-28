@@ -2,7 +2,7 @@ const PLUGIN_ID = 'tavern-claude-bridge';
 const API_BASE = `/api/plugins/${PLUGIN_ID}`;
 const UI_PREFIX = 'tcb';
 const SETTINGS_KEY = 'tavern_claude_bridge';
-const LOCAL_VERSION = '1.9.8';
+const LOCAL_VERSION = '1.9.9';
 const GITHUB_RELEASE_API = 'https://api.github.com/repos/Minijinai75/tavern-claude-bridge/releases/latest';
 let updateCache;
 
@@ -534,6 +534,20 @@ function buildPanel() {
         + '更新只做了一半。請重跑 install.ps1，然後重開 SillyTavern。'
         + '（面板更新只換前端；橋的本體在 plugins 資料夾，要跑腳本才會換，而它是啟動時載入的。）';
       infoEl.appendChild(版);
+    }
+
+    // SDK 版本提醒（26-09-28 v1.9.9）：太舊＝黃色警告；官方出新版／手動升到沒驗過的＝一行資訊。字句由後端組。
+    for (const w of (result.sdk?.warnings || [])) {
+      const 警 = document.createElement('div');
+      警.className = `${UI_PREFIX}-cache-warn`;
+      警.textContent = `⚠️ ${w}`;
+      infoEl.appendChild(警);
+    }
+    for (const s of (result.sdk?.infos || [])) {
+      const 訊 = document.createElement('div');
+      訊.className = `${UI_PREFIX}-cache-note`;
+      訊.textContent = `ℹ️ ${s}`;
+      infoEl.appendChild(訊);
     }
 
     // 環境變數警告（26-09-28 v1.9.8）：設了 ANTHROPIC_API_KEY 之類的，可能不走訂閱。只跳警告不擋（Mini 拍板）。

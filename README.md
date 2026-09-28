@@ -393,6 +393,7 @@ blocks=[無] subtype=success is_error=true usage=n/a cost=$0.0000
 - `TCB_SAFETY_TURNS`（預設 1）／`TCB_FALLBACK_DEPTH`（預設 8）／`TCB_JUMP_GAIN`（預設 40）：快取斷點演算法的研究參數——量到變動點後再往前退幾則、沒有基準時距尾保留幾則、斷點要能多納入幾則才值得跳。一般不用動。
 - `TCB_CLAUDEAI_MCP=1`：（1.9.7 起）讓你 claude.ai 帳號上的連接器照舊載進來。預設是擋掉的，因為模型偶爾會想去用它、然後撞上限變空回覆。只有對帳時才會想打開。
 - `TCB_VERBATIM=0`：（1.9.8 起）讓 Claude Code 照舊在每一則附上工作路徑、作業系統、「你是 Claude」那類資訊，也恢復 `@檔案路徑` 展開與斜線指令。預設是關掉的；只有對帳時才會想打開。
+- `TCB_NO_SDK_CHECK=1`：（1.9.9 起）不去 npm 查 Claude SDK 有沒有新版。預設每 12 小時查一次，只讀版本號、不送任何你的資料；查到新版只會在面板提醒一行，**不會自動升級**。
 - `TCB_AUTO_TITLE=1`：讓 SDK 每發另外叫一次 Haiku 生對話標題。預設關，因為那個標題沒有用途、還多花約四成 token；只有對帳時才會想打開。
 
 ---

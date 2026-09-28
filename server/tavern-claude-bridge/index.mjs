@@ -2680,6 +2680,79 @@ function readOwnVersion() {
   }
 }
 
+// SDK 版本提醒（26-09-28 v1.9.9，Mini 拍板「兩種都作」——她的原話「我會忘記大家要更新」）。
+// ① 裝的 SDK 比這版需要的舊 → 警告重跑 install.ps1（1.9.6 只換檔沒 npm install 就選不了 Opus 5.5；
+//    1.9.8 的 verbatimPrompts 在舊 CLI 會被默默忽略）。
+// ② npm 上官方出了比釘住版本新的 → 一行資訊、明說不用自己升：升級會自己帶東西進來（9/28 連接器、email 附件），
+//    新 SDK 要先驗過、跟新版橋一起發。這行同時提醒維護者該跟進了。
+// 「需要的版本」只從自己 package.json 的依賴讀（釘版那一格），不寫第二份。查不到最新版一律安靜；TCB_NO_SDK_CHECK=1 不連網。
+const SDK_PKG = '@anthropic-ai/claude-agent-sdk';
+const SDK_LATEST_URL = 'https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk/latest';
+const SDK_LATEST_TTL_MS = 12 * 60 * 60 * 1000;
+let sdkProbe = null;                                   // 測試注入：{ installed, fetchLatest }
+let sdkLatest = { version: null, at: 0 };
+
+export function compareVersions(a, b) {
+  const p = v => String(v || '').replace(/^[\^~]/, '').split('.').map(n => parseInt(n, 10) || 0);
+  const x = p(a), y = p(b);
+  for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0) ? 1 : -1;
+  return 0;
+}
+
+function readJson(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
+}
+function requiredSdkVersion() {
+  const dep = readJson(path.join(__dirname, 'package.json'))?.dependencies?.[SDK_PKG];
+  return dep ? dep.replace(/^[\^~]/, '') : null;
+}
+function installedSdkVersion() {
+  if (sdkProbe && 'installed' in sdkProbe) return sdkProbe.installed;
+  return readJson(path.join(__dirname, 'node_modules', ...SDK_PKG.split('/'), 'package.json'))?.version ?? null;
+}
+
+export function sdkReport({ installed, required, latest }) {
+  const warnings = [], infos = [];
+  const outdated = !!(installed && required && compareVersions(installed, required) < 0);
+  if (outdated) {
+    warnings.push(`你裝的 Claude SDK 是 ${installed}，這版小克橋需要 ${required}——請重跑 install.ps1（它會裝對的版本），然後重開 SillyTavern。`
+      + '只換檔案、沒重裝套件的話，新模型與新的保護設定可能沒作用。');
+  } else if (installed && required && compareVersions(installed, required) > 0) {
+    infos.push(`你裝的 Claude SDK 是 ${installed}，比小克橋驗證過的 ${required} 新——沒驗過的版本可能自己帶進新的預設行為。`
+      + '遇到怪問題先重跑 install.ps1，退回驗證過的版本。');
+  } else if (latest && required && compareVersions(latest, required) > 0) {
+    infos.push(`Claude 官方 SDK 出了新版 ${latest}（小克橋目前用驗證過的 ${required}）。`
+      + '不用自己升級——小克橋驗證後會跟著新版一起更新，到時面板會提醒你。');
+  }
+  return { outdated, warnings, infos };
+}
+
+export function sdkStatus() {
+  const installed = installedSdkVersion();
+  const required = requiredSdkVersion();
+  const latest = sdkLatest.version;
+  return { installed, required, latest, ...sdkReport({ installed, required, latest }) };
+}
+
+async function fetchLatestSdkVersion() {
+  const res = await fetch(SDK_LATEST_URL, { signal: AbortSignal.timeout(8000) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return (await res.json()).version || null;
+}
+
+// 查不到不丟錯：這是提醒，不是關卡。
+export async function refreshSdkLatest({ force = false } = {}) {
+  if (process.env.TCB_NO_SDK_CHECK === '1') { sdkLatest = { version: null, at: Date.now() }; return null; }
+  if (!force && sdkLatest.at && Date.now() - sdkLatest.at < SDK_LATEST_TTL_MS) return sdkLatest.version;
+  const fetcher = sdkProbe?.fetchLatest || fetchLatestSdkVersion;
+  let v = null;
+  try { v = await fetcher(); } catch { v = null; }
+  sdkLatest = { version: typeof v === 'string' ? v : null, at: Date.now() };
+  return sdkLatest.version;
+}
+
+export function _setSdkProbe(p) { sdkProbe = p; sdkLatest = { version: null, at: 0 }; }
+
 const info = {
   id: PLUGIN_ID,
   name: 'Claude Bridge',
@@ -2751,6 +2824,9 @@ async function init(router) {
     console.error(`[${PLUGIN_ID}] SDK not found: ${err.message}`);
     console.error(`[${PLUGIN_ID}] Run "npm install" in plugins/${PLUGIN_ID}/ and restart.`);
   }
+  // SDK 版本提醒（v1.9.9）：太舊就在終端機講；最新版在背景查，不擋啟動
+  for (const w of sdkStatus().warnings) console.warn(`[${PLUGIN_ID}] ⚠️ ${w}`);
+  refreshSdkLatest().catch(() => {});
 
   try {
     bridgeServer = await startBridge(DEFAULT_PORT);
@@ -2772,6 +2848,7 @@ async function init(router) {
         : { running: false },
       sdkAvailable: Boolean(queryFn),
       envWarnings: envWarnings(),   // 26-09-28 v1.9.8：面板靠它顯示 API key 之類的警告
+      sdk: (refreshSdkLatest().catch(() => {}), sdkStatus()),   // 26-09-28 v1.9.9：SDK 太舊／官方出新版（過期才在背景重查）
     });
   });
 
