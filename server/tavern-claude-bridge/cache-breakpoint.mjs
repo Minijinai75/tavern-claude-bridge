@@ -140,6 +140,7 @@ export const PRICE_TABLE = [
   { match: 'claude-opus-4-8',   input: 5,  output: 25, writeMul: 2, readMul: 0.1 },
   { match: 'claude-opus-4-7',   input: 5,  output: 25, writeMul: 2, readMul: 0.1 },
   { match: 'claude-opus-4-6',   input: 5,  output: 25, writeMul: 2, readMul: 0.1 },
+  { match: 'claude-sonnet-5-5', input: 2,  output: 10, writeMul: 2, readMul: 0.1 },  // 26-09-29 官方價目表：跟 Sonnet 5 同價；排在 sonnet-5 前面（前綴比對）
   { match: 'claude-sonnet-5',   input: 2,  output: 10, writeMul: 2, readMul: 0.1 },
   { match: 'claude-sonnet-4-6', input: 3,  output: 15, writeMul: 2, readMul: 0.1 },
   { match: 'claude-haiku-4-5',  input: 1,  output: 5,  writeMul: 2, readMul: 0.1 },
@@ -525,7 +526,8 @@ export function splitFlow(flow, cut) {
  * 模型改版時這張表要跟著更新；查不到的一律走表中最大值，不走寬鬆值。
  */
 export const CACHE_MIN_TOKENS = {
-  'claude-opus-5-5': 512,   // 26-09-23：官方門檻表尚未列 Opus 5.5，同 Opus 5 tokenizer 家族比照；查到不同數字要改
+  'claude-sonnet-5-5': 512,   // 26-09-29 官方 prompt-caching 頁：Sonnet 5.5 是 512（**不是** Sonnet 5 的 1024）；沒列會退到最嚴的 4096
+  'claude-opus-5-5': 512,   // 26-09-23 比照 Opus 5 填；26-09-29 官方 prompt-caching 頁已列 512，確認
   'claude-opus-5': 512,
   'claude-fable-5-1': 512,   // 26-09-02：同 Fable 5 家族，未另查到不同數字
   'claude-fable-5': 512,
@@ -591,6 +593,7 @@ export const CJK_TOKENS_PER_CHAR = {
   'claude-opus-4-7': 1.0,
   'claude-opus-4-8': 1.0,
   'claude-opus-5-5': 1.0,
+  'claude-sonnet-5-5': 1.0,   // 26-09-29 新 tokenizer 家族，1.0 是下界
   'claude-opus-5': 1.0,
   'claude-sonnet-5': 1.0,
   'claude-fable-5-1': 1.0,

@@ -408,6 +408,7 @@ const MODELS = [
   { id: 'claude-opus-4-8[1m]', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-fable-5-1', object: 'model', owned_by: 'anthropic' },   // 26-09-02 上線當天 Mini 點名加
   { id: 'claude-fable-5', object: 'model', owned_by: 'anthropic' },
+  { id: 'claude-sonnet-5-5', object: 'model', owned_by: 'anthropic' },   // 26-09-29 發布當天 Mini 點名加（CLI 2.1.280 會印 unrecognized_model 但照送，實測回的是 claude-sonnet-5-5）
   { id: 'claude-sonnet-5', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-sonnet-4-6', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-haiku-4-5', object: 'model', owned_by: 'anthropic' },
