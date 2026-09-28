@@ -71,7 +71,8 @@ $claudeCmd = Get-Command claude -ErrorAction SilentlyContinue
 if (-not $claudeCmd) {
     Write-Err "找不到 Claude Code CLI"
     Write-Host "    -> 打開 PowerShell 執行: npm install -g @anthropic-ai/claude-code"
-    Write-Host "    -> 裝完後執行: claude login (照畫面指示登入你的 Claude 帳號)"
+    Write-Host "    -> 裝完後執行: claude auth login (照畫面指示登入你的 Claude 帳號；舊版 Claude Code 是 claude login)"
+    Write-Host "    -> 登入後執行 claude auth status，看到 loggedIn: true 才算成功"
     Write-Host "    -> 登入完畢後重開 PowerShell，再跑一次這個腳本"
     exit 1
 }

@@ -241,6 +241,15 @@ async function releaseCurrent(reason) {
 const VALID_EFFORTS = ['auto', 'low', 'medium', 'high', 'max'];
 let configEffort = 'auto';
 
+// claude.ai 連接器開關（26-09-28，v1.9.7）。CLI 認 ENABLE_CLAUDEAI_MCP_SERVERS=false（claude.exe 內可查到該字串）。
+// options.env 是**整包取代**不是合併（sdk.d.ts 範例原文就是 { ...process.env, ... }）——
+// 漏展開 process.env，CLI 拿不到 PATH／USERPROFILE，連登入憑證都找不到。
+// 設 TCB_CLAUDEAI_MCP=1 可退回舊行為（連接器照舊載入），供對帳。
+function claudeAiConnectorsOption() {
+  if (process.env.TCB_CLAUDEAI_MCP === '1') return {};
+  return { env: { ...process.env, ENABLE_CLAUDEAI_MCP_SERVERS: 'false' } };
+}
+
 function effortOption() {
   return configEffort === 'auto' ? {} : { outputConfig: { effort: configEffort } };
 }
@@ -377,8 +386,17 @@ const EMPTY_REASONS = [
   {
     match: d => d.subtype === 'error_max_turns',
     label: '撞回合上限',
-    say: '這一則模型想動用工具，但這座橋只允許一次回合就結束（不開放工具）。'
-      + '通常是提示詞裡有「請搜尋／請執行」這類指令引發的，把那類句子拿掉就好。',
+    // 26-09-28 起帶工具名（外部回報）：模型想用的是 claude.ai 帳號上的連接器時，叫人去改提示詞是錯的路——
+    // 那不是卡或寫法的問題，是帳號上的小工具跟進來了（1.9.7 起 buildQueryOptions 預設擋掉）。
+    say: d => {
+      const tools = Array.isArray(d.toolNames) ? d.toolNames : [];
+      if (tools.some(n => n.startsWith('mcp__claude_ai_'))) {
+        return `這一則模型想用 claude.ai 帳號上的連接器（${tools.join('、')}），但這座橋只允許一回合、不開放工具。`
+          + '這不是卡或寫法的問題。1.9.7 起橋會預設擋掉這類連接器——還看到這句的話，確認酒館重啟過、而且沒有設 TCB_CLAUDEAI_MCP=1。';
+      }
+      return `這一則模型想動用工具${tools.length ? `（${tools.join('、')}）` : ''}，但這座橋只允許一次回合就結束（不開放工具）。`
+        + '通常是提示詞裡有「請搜尋／請執行」這類指令引發的，把那類句子拿掉就好。';
+    },
   },
   {
     match: d => d.stop_reason === 'max_tokens',
@@ -445,7 +463,7 @@ const EMPTY_REASONS = [
     say: '模型一個字都沒吐、也沒有任何用量——請求根本沒被送出去，重新生成不會有幫助。'
       + '兩種可能，先查第一個：\n'
       + '① **訂閱額度用完**——到 claude.ai 的 Settings → Usage 看還剩多少；等額度回補，或先換便宜一點的模型。\n'
-      + '② **登入憑證過期或沒更新成功**——在終端機執行 `claude login`，然後**重啟 SillyTavern**（憑證是啟動時載入的）。\n'
+      + '② **登入憑證過期或沒更新成功**——在終端機執行 `claude auth login`（舊版 Claude Code 是 `claude login`），用 `claude auth status` 確認看到 `loggedIn: true` 才算登好，然後**重啟 SillyTavern**（憑證是啟動時載入的）。\n'
       + '注意：面板的「自我健檢」在額度用完時同樣會失敗，所以它只能證明「現在不通」，'
       + '不能證明是憑證的錯——額度沒滿才往憑證查。',
   },
@@ -468,6 +486,8 @@ function emptyReplyNotice(reqNo, blockTypes, diag) {
   for (const k of ['stop_reason', 'subtype', 'num_turns', 'is_error']) {
     if (diag[k] !== undefined) parts.push(`${k}=${diag[k]}`);
   }
+  // 模型想用的工具名（26-09-28 外部回報）：沒這格，撞回合上限時得去翻 SDK 對話檔才知道是誰
+  if (Array.isArray(diag.toolNames) && diag.toolNames.length) parts.push(`tools=${diag.toolNames.join(',')}`);
   // result 自己帶的文字要印出來——它是「額度用盡」與「憑證失效」唯一的分辨線索，
   // 不印的話下一個人只能看著兩個同形的指紋猜（26-08-03 外部使用者案的直接教訓）
   if (diag.resultText) parts.push(`result="${diag.resultText.replace(/\s+/g, ' ').slice(0, 120)}"`);
@@ -489,6 +509,8 @@ function emptyReplyNotice(reqNo, blockTypes, diag) {
       num_turns: diag.num_turns, is_error: diag.is_error, costUsd: diag.costUsd,
       // 這格就是「額度用盡 vs 憑證失效」的分辨依據——沒有它，兩種病因在事後完全同形
       resultText: diag.resultText ?? null,
+      // 模型想用的工具（26-09-28）：null＝這一則沒動工具；有值才是撞回合上限的真兇
+      tools: Array.isArray(diag.toolNames) && diag.toolNames.length ? diag.toolNames : null,
     }, { keepBytes: 256 * 1024 });
   } catch (e) {
     // 不靜默吞：落檔壞掉會讓「事後撈得到」變成空頭支票，而那正是這段存在的理由
@@ -1938,6 +1960,10 @@ export function buildQueryOptions(modelId, systemPrompt, { stream, sysInFirstTur
     persistSession: persistSessionOption(),
     ...(stream ? { includePartialMessages: true } : {}),
     settingSources: [],
+    // 擋掉 claude.ai 帳號層級的連接器（26-09-28 外部回報，v1.9.7）。tools: [] 只關內建工具——
+    // 帳號上掛的連接器（例如 Claude Docs）SDK 照樣自動載入，而它的說明文字叫模型「先呼叫 guide」，
+    // 模型偶爾照做就撞 maxTurns: 1 → 間歇性空回覆（回報者翻 SDK 對話檔抓到四次全是它；修前 20 檔 13 檔帶、修後 0）。
+    ...claudeAiConnectorsOption(),
     ...thinkingOption(),
     ...effortOption(),
   };
@@ -2029,7 +2055,7 @@ function humanError(err) {
   const msg = (err && err.message) || String(err);
   const withRaw = text => `${text}（原始錯誤：${msg}）`;
   if (/not.?(logged|authenticated)|please.?log.?in|unauthorized|401/i.test(msg)) {
-    return withRaw('Claude Code 尚未登入。請在終端機執行 claude login 完成訂閱登入後重啟 SillyTavern。');
+    return withRaw('Claude Code 尚未登入。請在終端機執行 claude auth login（舊版 Claude Code 是 claude login）完成訂閱登入，用 claude auth status 確認看到 loggedIn: true 後重啟 SillyTavern。');
   }
   if (/rate.?limit|too.?many|quota|exceeded/i.test(msg)) {
     return withRaw('額度已達上限或請求太頻繁。稍後再試，或到 claude.ai Settings → Usage 查看額度。');
@@ -2353,6 +2379,7 @@ async function handleChatCompletions(req, res) {
           if (msg.type === 'assistant') {
             for (const block of msg.message?.content || []) {
               blockTypes.push(block.type);   // 空回覆時唯一的線索：這輪到底產出了什麼
+              if (block.type === 'tool_use' && block.name) (diag.toolNames ||= []).push(block.name);
               if (block.type === 'text') fullText += block.text || '';
               // 第二層防禦（26-07-27 退修）：就算模型端仍產 thinking block，關閉時也不收
               else if (configThinking && block.type === 'thinking') thinkingText += block.thinking || '';
@@ -2461,6 +2488,7 @@ async function handleChatCompletions(req, res) {
           const event = msg.event;
           if (event.type === 'content_block_start' && event.content_block?.type) {
             blockTypes.push(event.content_block.type);
+            if (event.content_block.type === 'tool_use' && event.content_block.name) (diag.toolNames ||= []).push(event.content_block.name);
           }
           if (event.type === 'message_delta' && event.delta?.stop_reason) {
             diag.stop_reason = event.delta.stop_reason;
@@ -2637,6 +2665,9 @@ async function runSelfTest() {
         tools: [], maxTurns: 1, model: 'claude-haiku-4-5',
         permissionMode: 'dontAsk', persistSession: persistSessionOption(), settingSources: [],
         thinking: { type: 'disabled' },
+        // 健檢是第三條送 SDK 的路，options 手寫、不走 buildQueryOptions——連接器開關要另外帶
+        // （26-09-28 實彈抓到：兩條聊天路徑修好了，健檢這發的對話檔照樣帶 8 個 Claude_Docs 工具）。
+        ...claudeAiConnectorsOption(),
       },
     });
     let text = '';
@@ -2661,7 +2692,7 @@ async function runSelfTest() {
       raw: result ? JSON.stringify(result).slice(0, 800) : null,
       message: '❌ SDK 在這個進程裡叫得動、但模型一個字都沒吐。兩種可能，先查第一個：'
         + '① **訂閱額度用完**（到 claude.ai → Settings → Usage 看一眼，健檢這一發同樣會撞額度，'
-        + '所以健檢失敗不等於憑證壞了）② **登入憑證失效**（終端機 `claude login` 後重啟 SillyTavern）。'
+        + '所以健檢失敗不等於憑證壞了）② **登入憑證失效**（終端機 `claude auth login`——舊版 Claude Code 是 `claude login`——用 `claude auth status` 確認看到 `loggedIn: true` 後重啟 SillyTavern）。'
         + '兩個都不是的話，把這整段連同上面那行「執行環境：…」貼給維護者。',
     };
   } catch (err) {

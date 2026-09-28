@@ -33,7 +33,7 @@ Claude Code 是 Anthropic 的官方命令列工具，你用 Claude 訂閱帳號�
 1. 安裝 Node.js（到 [nodejs.org](https://nodejs.org/) 下載 LTS 版本，一路下一步即可）
 2. 打開終端機（Windows: PowerShell；Mac: Terminal）
 3. 執行：`npm install -g @anthropic-ai/claude-code`
-4. 執行：`claude login`
+4. 執行：`claude auth login`（舊版 Claude Code 是 `claude login`），登完跑 `claude auth status`，看到 `loggedIn: true` 才算成功
 5. 照畫面指示完成訂閱登入
 
 完成後執行 `claude --version` 確認有版本號出來就行。
@@ -297,7 +297,7 @@ v1.2.0 之前這個是寫死開啟的、沒得選，上面那些症狀因此無�
 
 | 錯誤 | 意思 | 怎麼辦 |
 |---|---|---|
-| Claude Code 尚未登入 | 沒有有效的登入狀態 | 終端機跑 `claude login` 重新登入 |
+| Claude Code 尚未登入 | 沒有有效的登入狀態 | 終端機跑 `claude auth login` 重新登入（舊版是 `claude login`），`claude auth status` 看到 `loggedIn: true` 才算 |
 | 額度已達上限 | 訂閱額度用完了 | 到 claude.ai Settings → Usage 查看額度 |
 | Claude 伺服器忙碌中 | Anthropic 那邊過載 | 等幾分鐘再試 |
 | 找不到 Claude Code CLI | Claude Code 沒裝或 PATH 沒設好 | 重裝：`npm install -g @anthropic-ai/claude-code` |
@@ -327,7 +327,7 @@ blocks=[無] subtype=success is_error=true usage=n/a cost=$0.0000
 
 `blocks=[無]` 加上沒有 usage、沒有扣費，代表這一則**根本沒真的生成就結束了**——不是模型寫一半斷掉，是它壓根沒開始。這種情況**按重新生成一百次也沒用**。解法：
 
-1. 到終端機執行 `claude login` 重新登入
+1. 到終端機執行 `claude auth login` 重新登入（舊版 Claude Code 是 `claude login`；新版打舊指令不會報錯，但它只是開了一個新對話、憑證根本沒更新），用 `claude auth status` 確認看到 `loggedIn: true`
 2. **重啟 SillyTavern**（憑證是啟動時載入的，不重啟不會生效）
 3. 再按一次「自我健檢」確認
 
