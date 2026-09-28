@@ -1,11 +1,16 @@
 {
   "name": "tavern-claude-bridge",
-  "version": "1.9.9",
+  "version": "1.9.10",
   "type": "module",
   "description": "SillyTavern server plugin: bridges to Claude via official Agent SDK",
   "license": "AGPL-3.0-only",
   "main": "index.mjs",
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.280"
+  },
+  "tavernClaudeBridge": {
+    "sdkSkipped": {
+      "0.3.283": "它內建的 Claude Code 2.1.283 會把工作路徑、作業系統和「你是 Claude」那句身分說明附回每一則對話（1.9.8 才擋掉的東西），還多夾帳號的組織編號"
+    }
   }
 }

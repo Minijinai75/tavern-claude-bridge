@@ -2706,21 +2706,30 @@ function requiredSdkVersion() {
   const dep = readJson(path.join(__dirname, 'package.json'))?.dependencies?.[SDK_PKG];
   return dep ? dep.replace(/^[\^~]/, '') : null;
 }
+// 驗過、不跟進的 SDK 版本（26-09-28 v1.9.10）：官方最新版在清單上就不提醒；有人（或他的 agent）自己升到清單上的版本＝警告並講理由。
+// 清單跟釘版放同一個檔（package.json 的 tavernClaudeBridge.sdkSkipped），隨橋一起發。
+function skippedSdkVersions() {
+  return readJson(path.join(__dirname, 'package.json'))?.tavernClaudeBridge?.sdkSkipped || {};
+}
 function installedSdkVersion() {
   if (sdkProbe && 'installed' in sdkProbe) return sdkProbe.installed;
   return readJson(path.join(__dirname, 'node_modules', ...SDK_PKG.split('/'), 'package.json'))?.version ?? null;
 }
 
-export function sdkReport({ installed, required, latest }) {
+export function sdkReport({ installed, required, latest, skipped = {} }) {
   const warnings = [], infos = [];
+  const skipReason = v => (v && Object.prototype.hasOwnProperty.call(skipped, v.replace(/^[\^~]/, ''))) ? skipped[v.replace(/^[\^~]/, '')] : null;
   const outdated = !!(installed && required && compareVersions(installed, required) < 0);
   if (outdated) {
     warnings.push(`你裝的 Claude SDK 是 ${installed}，這版小克橋需要 ${required}——請重跑 install.ps1（它會裝對的版本），然後重開 SillyTavern。`
       + '只換檔案、沒重裝套件的話，新模型與新的保護設定可能沒作用。');
+  } else if (skipReason(installed)) {
+    warnings.push(`你裝的 Claude SDK ${installed} 是小克橋驗過、決定不跟進的版本：${skipReason(installed)}。`
+      + `請重跑 install.ps1 退回 ${required}，然後重開 SillyTavern。`);
   } else if (installed && required && compareVersions(installed, required) > 0) {
     infos.push(`你裝的 Claude SDK 是 ${installed}，比小克橋驗證過的 ${required} 新——沒驗過的版本可能自己帶進新的預設行為。`
       + '遇到怪問題先重跑 install.ps1，退回驗證過的版本。');
-  } else if (latest && required && compareVersions(latest, required) > 0) {
+  } else if (latest && required && compareVersions(latest, required) > 0 && !skipReason(latest)) {
     infos.push(`Claude 官方 SDK 出了新版 ${latest}（小克橋目前用驗證過的 ${required}）。`
       + '不用自己升級——小克橋驗證後會跟著新版一起更新，到時面板會提醒你。');
   }
@@ -2731,7 +2740,7 @@ export function sdkStatus() {
   const installed = installedSdkVersion();
   const required = requiredSdkVersion();
   const latest = sdkLatest.version;
-  return { installed, required, latest, ...sdkReport({ installed, required, latest }) };
+  return { installed, required, latest, ...sdkReport({ installed, required, latest, skipped: skippedSdkVersions() }) };
 }
 
 async function fetchLatestSdkVersion() {
