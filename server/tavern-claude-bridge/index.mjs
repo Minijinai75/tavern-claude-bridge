@@ -241,17 +241,48 @@ async function releaseCurrent(reason) {
 const VALID_EFFORTS = ['auto', 'low', 'medium', 'high', 'max'];
 let configEffort = 'auto';
 
-// claude.ai 連接器開關（26-09-28，v1.9.7）。CLI 認 ENABLE_CLAUDEAI_MCP_SERVERS=false（claude.exe 內可查到該字串）。
-// options.env 是**整包取代**不是合併（sdk.d.ts 範例原文就是 { ...process.env, ... }）——
-// 漏展開 process.env，CLI 拿不到 PATH／USERPROFILE，連登入憑證都找不到。
-// 設 TCB_CLAUDEAI_MCP=1 可退回舊行為（連接器照舊載入），供對帳。
-function claudeAiConnectorsOption() {
-  if (process.env.TCB_CLAUDEAI_MCP === '1') return {};
-  return { env: { ...process.env, ENABLE_CLAUDEAI_MCP_SERVERS: 'false' } };
+// 鎖門清單（26-09-28 v1.9.8）。這座橋是**純聊天通道**：模型只能回文字，任何工具、任何外部上下文都不該進來。
+// 而 SDK 有一類東西不是「你沒開就不在」，是「你沒明確關就會自己進來」——同一天抓到兩批：
+//   v1.9.7 claude.ai 帳號上的連接器（外部回報：模型去呼叫 Claude Docs 的 guide → 撞 maxTurns → 空回覆）
+//   v1.9.8 CLI 2.1.280 起每回合自動附加帳號 email、工作路徑、作業系統、「You are powered by…」、日期
+//          （9/23 升 SDK 那天起每份酒館對話檔都有；settingSources 管不到——唯讀審核員 claude-opus-5-5 抓的）
+// **送 SDK 的每一條路（非串流、串流、自我健檢）都從這裡拿鎖**，不准各自手寫——v1.9.7 就是健檢手寫 options 漏修，
+// 實彈才看到。lockdown.test 守「三條路的鎖一模一樣」，以後加鎖只改這一處。
+// 每一道都查過 sdk.d.ts 原文／claude.exe 字串，行號與出處見 lockdown.test 檔頭。
+function lockdownOptions() {
+  const connectorsOn = process.env.TCB_CLAUDEAI_MCP === '1';   // 逃生門：對帳用，連接器照舊載入
+  // env 是**整包取代**不是合併（sdk.d.ts 範例原文 { ...process.env, ... }）——漏展開，CLI 拿不到 PATH／USERPROFILE、連憑證都找不到
+  const env = {
+    ...process.env,
+    // settingSources: [] 讓使用者設定裡的 autoMemoryEnabled 讀不到，於是走預設「開」（claude.exe 字串確認）
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
+  };
+  if (!connectorsOn) env.ENABLE_CLAUDEAI_MCP_SERVERS = 'false';
+  // ST 若是從某個 Claude Code 會話裡重啟的，會繼承那個會話的身分變數（實證：entrypoint 從 sdk-ts 變 sdk-cli）。
+  // 拿掉讓 SDK 自己補正確的值（它只在沒設時才補）。
+  delete env.CLAUDECODE;
+  delete env.CLAUDE_CODE_ENTRYPOINT;
+  return {
+    tools: [],                                    // 內建工具全關（轉成 --tools ""）
+    disallowedTools: ['WebSearch', 'WebFetch'],   // 搜尋與抓網頁的第二道鎖：tools 哪天被改成 preset 也擋得住
+    maxTurns: 1,
+    permissionMode: 'dontAsk',                    // 沒預先放行就拒絕
+    settingSources: [],                           // 使用者的 settings／CLAUDE.md 不進來
+    // prompt 是酒館組出來的、不是使用者親手打的——sdk.d.ts 原文說這種情況就該開。它同時關掉：
+    // @路徑檔案展開（角色卡寫 @config.yaml 就會把檔案讀進來）、斜線指令分派、以及整批每回合附件（email／路徑／身分句／日期）。
+    // 附件拿掉後第一發快取會重建一次；之後少了每天變的日期，快取反而更穩。TCB_VERBATIM=0 退回，供對帳。
+    ...(process.env.TCB_VERBATIM === '0' ? {} : { verbatimPrompts: true }),
+    // MCP 只認明確傳入的（我們傳的是沒有）——跟連接器旗標是兩道鎖；逃生門要兩道一起拿掉才真的退回
+    ...(connectorsOn ? {} : { strictMcpConfig: true }),
+    env,
+  };
 }
 
+// 26-09-28 v1.9.8 修正：以前送的是 outputConfig: { effort }——SDK 根本沒有這個欄位（sdk.d.ts／sdk.mjs 都是 0 筆），
+// 整欄被默默丟掉，面板選什麼都跑預設 high。正確是頂層 effort（sdk.d.ts:1851，SDK 轉成 --effort）。
+// 沒有任何測試管送出去的形狀，所以錯了兩個月沒人發現——effort-env.test 補上那一格。
 function effortOption() {
-  return configEffort === 'auto' ? {} : { outputConfig: { effort: configEffort } };
+  return configEffort === 'auto' ? {} : { effort: configEffort };
 }
 
 // SDK 原生思考摘要（26-07-27 加開關，預設關）。
@@ -920,6 +951,19 @@ function describeUsageShape(usage) {
 // 有沒有自訂 CLAUDE_CONFIG_DIR，全都會影響它找不找得到 CLI 與登入憑證。
 // 這幾行印出來，下次同型問題五分鐘就能對帳，不必再花一晚做排除法。
 // 只印「有沒有／叫什麼」，不印 PATH 全文與任何憑證內容。
+// 環境變數警告（26-09-28 v1.9.8，Mini 拍板「跳警告」、不擋——有人可能是刻意設的）。
+// 子程序會繼承 ST 進程的環境變數；這幾個一設，Claude Code 可能不走訂閱、改走別的計費或別的伺服器。
+// 只報有沒有、不印值。終端機與面板（/status → envWarnings）都看得到——使用者很少去看終端機。
+const ENV_WARNINGS = [
+  ['ANTHROPIC_API_KEY', '偵測到環境變數 ANTHROPIC_API_KEY：Claude Code 可能改用 API 金鑰計費，而不是你的訂閱額度。不是刻意設的話，請移除它再重啟 SillyTavern。'],
+  ['ANTHROPIC_BASE_URL', '偵測到環境變數 ANTHROPIC_BASE_URL：請求會送到你指定的伺服器，不是 Anthropic 官方；計費與登入都照那邊的規則。'],
+  ['CLAUDE_CODE_USE_BEDROCK', '偵測到環境變數 CLAUDE_CODE_USE_BEDROCK：Claude Code 會改走 AWS Bedrock 計費，不是訂閱額度。'],
+  ['CLAUDE_CODE_USE_VERTEX', '偵測到環境變數 CLAUDE_CODE_USE_VERTEX：Claude Code 會改走 Google Vertex 計費，不是訂閱額度。'],
+];
+export function envWarnings() {
+  return ENV_WARNINGS.filter(([k]) => process.env[k]).map(([, msg]) => msg);
+}
+
 function logEnvFingerprint() {
   try {
     const home = process.env.USERPROFILE || process.env.HOME || '(未設)';
@@ -930,6 +974,7 @@ function logEnvFingerprint() {
       + `｜家目錄 ${home === '(未設)' ? '⚠️ 未設' : '已設'}`
       + `｜CLAUDE_CONFIG_DIR ${cfgDir ? cfgDir : '(未設，走預設 ~/.claude)'}`
     );
+    for (const w of envWarnings()) console.warn(`[${PLUGIN_ID}] ⚠️ ${w}`);
   } catch {}
 }
 
@@ -1947,23 +1992,16 @@ export function buildQueryOptions(modelId, systemPrompt, { stream, sysInFirstTur
     // ③ 開關開：系統提示已放進 prompt 那則 user 的 content[0]，這裡**不傳**（SDK 的內建句仍在，那不歸我們管）。
     // 一處改、兩條路徑都生效——這正是 26-09-02 把 options 抽成一支的理由。
     systemPrompt: sysInFirstTurn ? undefined : systemPromptForSdk(systemPrompt),
-    tools: [],
+    ...lockdownOptions(),
     // 省掉自動標題生成（26-08-01 實測發現）。
     // SDK 型別原文：提供 title 就「skips automatic title generation」。
     // 不給的話，每次請求 SDK 會另外叫一次 Haiku 去生標題——實測它吃 527 tokens 輸入，
     // 比主模型那次（161）還多三倍，佔總成本約四成。那個標題從頭到尾沒有任何用途。
     // 設 TCB_AUTO_TITLE=1 可退回舊行為（重新讓 SDK 自動生標題），供對帳。
     title: process.env.TCB_AUTO_TITLE === '1' ? undefined : 'SillyTavern bridge',
-    maxTurns: 1,
     model: modelId,
-    permissionMode: 'dontAsk',
     persistSession: persistSessionOption(),
     ...(stream ? { includePartialMessages: true } : {}),
-    settingSources: [],
-    // 擋掉 claude.ai 帳號層級的連接器（26-09-28 外部回報，v1.9.7）。tools: [] 只關內建工具——
-    // 帳號上掛的連接器（例如 Claude Docs）SDK 照樣自動載入，而它的說明文字叫模型「先呼叫 guide」，
-    // 模型偶爾照做就撞 maxTurns: 1 → 間歇性空回覆（回報者翻 SDK 對話檔抓到四次全是它；修前 20 檔 13 檔帶、修後 0）。
-    ...claudeAiConnectorsOption(),
     ...thinkingOption(),
     ...effortOption(),
   };
@@ -2662,12 +2700,12 @@ async function runSelfTest() {
     const q = queryFn({
       prompt: '回答一個字：好',
       options: {
-        tools: [], maxTurns: 1, model: 'claude-haiku-4-5',
-        permissionMode: 'dontAsk', persistSession: persistSessionOption(), settingSources: [],
+        // 健檢是第三條送 SDK 的路。鎖從 lockdownOptions 拿，不手寫——v1.9.7 就是這裡手寫漏修，實彈才抓到。
+        ...lockdownOptions(),
+        model: 'claude-haiku-4-5',
+        title: 'SillyTavern bridge selftest',   // 省掉自動標題那一發 Haiku（同 buildQueryOptions 的理由）
+        persistSession: persistSessionOption(),
         thinking: { type: 'disabled' },
-        // 健檢是第三條送 SDK 的路，options 手寫、不走 buildQueryOptions——連接器開關要另外帶
-        // （26-09-28 實彈抓到：兩條聊天路徑修好了，健檢這發的對話檔照樣帶 8 個 Claude_Docs 工具）。
-        ...claudeAiConnectorsOption(),
       },
     });
     let text = '';
@@ -2733,6 +2771,7 @@ async function init(router) {
         ? { running: true, host: HOST, port: DEFAULT_PORT, busy: current !== null, effort: configEffort, split: configSplit, splitLocked: SPLIT_LOCKED_OFF, requestCount, totalCostUsd, cache: cacheSummary(), models: MODELS.map(m => m.id) }
         : { running: false },
       sdkAvailable: Boolean(queryFn),
+      envWarnings: envWarnings(),   // 26-09-28 v1.9.8：面板靠它顯示 API key 之類的警告
     });
   });
 

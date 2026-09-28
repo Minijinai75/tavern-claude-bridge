@@ -2,7 +2,7 @@ const PLUGIN_ID = 'tavern-claude-bridge';
 const API_BASE = `/api/plugins/${PLUGIN_ID}`;
 const UI_PREFIX = 'tcb';
 const SETTINGS_KEY = 'tavern_claude_bridge';
-const LOCAL_VERSION = '1.9.7';
+const LOCAL_VERSION = '1.9.8';
 const GITHUB_RELEASE_API = 'https://api.github.com/repos/Minijinai75/tavern-claude-bridge/releases/latest';
 let updateCache;
 
@@ -130,6 +130,9 @@ function buildPanel() {
             <span>使用 Claude 原生思考摘要</span>
           </label>
           <small>預設關閉。你的預設如果自己會要求角色輸出思考（例如正文開頭的 <code>&lt;thinking&gt;</code> 區塊），請保持關閉——兩者會搶同一條通道，開著會讓思考變成中英混雜、偶爾整輪空白回覆。用素卡、想看 Claude 自己的推理摘要再打開。</small>
+        </div>
+        <div class="${UI_PREFIX}-option">
+          <small>推理耗費（AI 回覆設定裡的 Reasoning Effort 下拉選單）會同步給橋：選越高，模型想得越久，也越耗訂閱額度；選 Auto 就交給 Claude Code 的預設（high）。1.9.8 以前這個選單其實沒有送到模型，1.9.8 起才真的生效——之前選了 Maximum 的人，更新後會開始比較耗額度。</small>
         </div>
         <div class="${UI_PREFIX}-option">
           <label class="checkbox_label">
@@ -531,6 +534,14 @@ function buildPanel() {
         + '更新只做了一半。請重跑 install.ps1，然後重開 SillyTavern。'
         + '（面板更新只換前端；橋的本體在 plugins 資料夾，要跑腳本才會換，而它是啟動時載入的。）';
       infoEl.appendChild(版);
+    }
+
+    // 環境變數警告（26-09-28 v1.9.8）：設了 ANTHROPIC_API_KEY 之類的，可能不走訂閱。只跳警告不擋（Mini 拍板）。
+    for (const w of (result.envWarnings || [])) {
+      const 警 = document.createElement('div');
+      警.className = `${UI_PREFIX}-cache-warn`;
+      警.textContent = `⚠️ ${w}`;
+      infoEl.appendChild(警);
     }
 
     if (!result.sdkAvailable) {
