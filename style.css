@@ -153,6 +153,30 @@
   white-space: normal;
 }
 
+/* 快取倒數膠囊（v1.9.11）：浮在輸入框右上角外緣，不佔排版——送出列左右按鈕區在手機上只有一個字寬 */
+#send_form { position: relative; }
+.tcb-cachetimer {
+  position: absolute;
+  top: -1.7em;
+  right: 0.6em;
+  z-index: 5;
+  padding: 0.1em 0.6em;
+  border-radius: 999px;
+  font-size: 0.78em;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  user-select: none;
+  border: 1px solid var(--SmartThemeBorderColor);
+  background: var(--SmartThemeBlurTintColor);
+  backdrop-filter: blur(var(--SmartThemeBlurStrength));
+  opacity: 0.85;
+}
+.tcb-cachetimer:hover { opacity: 1; }
+.tcb-cachetimer[data-state="warm"] { color: #7fc98f; }
+.tcb-cachetimer[data-state="soon"] { color: #e0b050; }
+.tcb-cachetimer[data-state="cold"] { opacity: 0.55; }
+
 .tcb-cache button {
   margin-top: 6px;
 }

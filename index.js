@@ -2,7 +2,7 @@ const PLUGIN_ID = 'tavern-claude-bridge';
 const API_BASE = `/api/plugins/${PLUGIN_ID}`;
 const UI_PREFIX = 'tcb';
 const SETTINGS_KEY = 'tavern_claude_bridge';
-const LOCAL_VERSION = '1.9.10';
+const LOCAL_VERSION = '1.9.11';
 const GITHUB_RELEASE_API = 'https://api.github.com/repos/Minijinai75/tavern-claude-bridge/releases/latest';
 let updateCache;
 
@@ -20,6 +20,8 @@ const DEFAULT_SETTINGS = {
   // 省更多快取＝系統提示走對話第一則（26-09-02 第二波 b ③，試驗中）。預設關——關的時候一切跟現在一樣。
   // 開了會多一個快取點（長對話省更多），代價是角色卡從 system 角色變 user 角色、語氣可能微妙地變，所以由使用者自己選。
   sysInFirstTurn: false,
+  // 快取倒數（26-09-29 v1.9.11）。預設開——聊天輸入框右上角一顆小膠囊，告訴你快取還有多久冷掉。
+  cacheCountdown: true,
 };
 
 function getCtx() {
@@ -76,6 +78,123 @@ async function checkForUpdate() {
   return updateCache;
 }
 
+// ══ 快取倒數（26-09-29 v1.9.11）══
+// Mini 從 coralline 狀態列偷師：「如果有開啟的話可以在一個小欄位出現快取倒數」。
+// 聊天輸入框右上角浮一顆小膠囊（不佔排版——送出列左右按鈕區在手機上只有一個字寬，塞文字會擠壞），
+// 點它跳出完整一句話；擴充面板裡也印同一句。倒數在瀏覽器每秒跳，只有收到回覆時才問後端一次。
+// 剩餘時間用「後端的過期時間 − 後端的現在」算（serverNowMs），手機遠端連進來時鐘不準也不會錯。
+function cacheTimerTtlLabel(ttlSec) {
+  if (ttlSec === 3600) return '1 小時';
+  if (ttlSec === 300) return '5 分鐘';
+  return ttlSec >= 3600 ? `${Math.round(ttlSec / 3600)} 小時` : `${Math.round(ttlSec / 60)} 分鐘`;
+}
+function cacheTimerClock(ms) {
+  const sec = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  const pad = n => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+// 完整一句話（面板與點膠囊時用）。timer＝後端的 cacheTimer；remainingMs＝還剩幾毫秒（壽命未知時傳 null）。
+function cacheTimerText(timer, remainingMs) {
+  if (!timer) return '';
+  if (!timer.warm) return '⛁ 上一則沒用到快取——下一則會整包計算';
+  if (!timer.ttlSec || remainingMs === null || remainingMs === undefined) return '⛁ 快取熱著（還沒量到它能活多久，下一則寫入快取時就知道）';
+  const clock = (ms) => { const sec = Math.max(0, Math.floor(ms / 1000)); const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60; const pad = n => String(n).padStart(2, '0'); return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`; };
+  const ttl = timer.ttlSec === 3600 ? '1 小時' : timer.ttlSec === 300 ? '5 分鐘' : `${Math.round(timer.ttlSec / 60)} 分鐘`;
+  if (remainingMs <= 0) return `⛁ 快取已經冷掉了——下一則會重建一次，比較貴是正常的（你的快取能活 ${ttl}）`;
+  return `⛁ 快取還熱著，${clock(remainingMs)} 後冷掉（${ttl}快取；在這之前回覆就不用重建，每回一則會重新計時）`;
+}
+
+let cacheTimerState = null;   // { timer, offsetMs, chatId }
+let cacheTimerTick = null;
+
+function currentChatId() {
+  const ctx = getCtx();
+  try { return ctx?.getCurrentChatId?.() ?? ctx?.chatId ?? null; } catch { return null; }
+}
+
+function cacheTimerRemaining() {
+  const t = cacheTimerState?.timer;
+  if (!t?.expiresAtMs) return null;
+  return t.expiresAtMs - (Date.now() + (cacheTimerState.offsetMs || 0));
+}
+
+function ensureCacheBadge() {
+  let el = document.getElementById(`${UI_PREFIX}-cachetimer`);
+  if (el) return el;
+  const form = document.getElementById('send_form');
+  if (!form) return null;
+  el = document.createElement('div');
+  el.id = `${UI_PREFIX}-cachetimer`;
+  el.className = `${UI_PREFIX}-cachetimer`;
+  el.title = '小克橋：快取倒數（點一下看說明）';
+  el.addEventListener('click', () => {
+    const msg = cacheTimerSentence();
+    if (!msg) return;
+    if (globalThis.toastr) globalThis.toastr.info(msg, '小克橋', { timeOut: 8000 });
+    else alert(msg);
+  });
+  form.appendChild(el);
+  return el;
+}
+
+// 換了聊天：倒數屬於上一個聊天，不拿來騙人
+function cacheTimerSentence() {
+  if (!cacheTimerState) return '';
+  // 不知道是哪個聊天的（剛打開／重新整理後拿到的）→ 不報倒數。Mini 26-09-29 01:56 抓的：她沒聊天，膠囊卻顯示我測試那發的倒數
+  if (!cacheTimerState.chatId) return '⛁ 最近一次快取不確定是哪個聊天的（剛打開或重新整理過）——送出下一則就會開始倒數';
+  if (cacheTimerState.chatId && currentChatId() && cacheTimerState.chatId !== currentChatId()) {
+    return '⛁ 換了聊天——這個聊天的快取狀態要等你送出下一則才知道';
+  }
+  return cacheTimerText(cacheTimerState.timer, cacheTimerRemaining());
+}
+
+function renderCacheTimer() {
+  const on = loadSettings().cacheCountdown !== false;
+  const badge = ensureCacheBadge();
+  const panelLine = document.getElementById(`${UI_PREFIX}-cachetimer-line`);
+  const sentence = on ? cacheTimerSentence() : '';
+  if (panelLine) panelLine.textContent = sentence;
+  if (!badge) return;
+  const t = cacheTimerState?.timer;
+  const switched = cacheTimerState?.chatId && currentChatId() && cacheTimerState.chatId !== currentChatId();
+  const ownerUnknown = !cacheTimerState?.chatId;
+  if (!on || !t || switched || ownerUnknown) { badge.hidden = true; return; }
+  badge.hidden = false;
+  const rem = cacheTimerRemaining();
+  let label, state;
+  if (!t.warm) { label = '⛁ 沒用到'; state = 'cold'; }
+  else if (rem === null) { label = '⛁ 熱著'; state = 'warm'; }
+  else if (rem <= 0) { label = '⛁ 冷了'; state = 'cold'; }
+  else { label = `⛁ ${cacheTimerClock(rem)}`; state = rem < 60_000 ? 'soon' : 'warm'; }
+  badge.textContent = label;
+  badge.dataset.state = state;
+  // 不在這裡改 title：這支每秒跑，說明文字含秒數，每秒換 title 會讓滑鼠提示框每秒重畫＝快閃（Mini 26-09-29 01:55 抓的）。整句靠點一下看
+}
+
+// fromReply：這一刻是不是「這個頁面剛收到一則回覆」。只有這種時候才知道最新那發快取屬於眼前這個聊天；
+// 剛打開、重新整理時問到的那發可能是別的聊天、別的分頁、甚至別的程式打的——記下來但不認主（chatId=null），膠囊不顯示。
+async function refreshCacheTimer({ fromReply = false } = {}) {
+  const result = await probePlugin();
+  const cache = result?.bridge?.cache;
+  if (!cache) return;
+  const timer = cache.cacheTimer ?? null;
+  // 同一發不重記 chatId——不然一換聊天就刷新，會把舊聊天的倒數安到新聊天頭上
+  if (!timer) { cacheTimerState = null; }
+  else if (!cacheTimerState || cacheTimerState.timer?.startedAtMs !== timer.startedAtMs) {
+    cacheTimerState = { timer, offsetMs: typeof cache.serverNowMs === 'number' ? cache.serverNowMs - Date.now() : 0, chatId: fromReply ? currentChatId() : null };
+  } else {
+    cacheTimerState.timer = timer;
+    if (fromReply && !cacheTimerState.chatId) cacheTimerState.chatId = currentChatId();
+  }
+  renderCacheTimer();
+}
+
+function startCacheTimer() {
+  if (cacheTimerTick) return;
+  cacheTimerTick = setInterval(renderCacheTimer, 1000);
+}
+
 async function probePlugin() {
   try {
     const res = await fetch(`${API_BASE}/status`, {
@@ -117,6 +236,14 @@ function buildPanel() {
         <div class="${UI_PREFIX}-update" id="${UI_PREFIX}-update"></div>
         <div class="${UI_PREFIX}-models" id="${UI_PREFIX}-models"></div>
         <div class="${UI_PREFIX}-cache" id="${UI_PREFIX}-cache"></div>
+        <div class="${UI_PREFIX}-option">
+          <label class="checkbox_label">
+            <input type="checkbox" id="${UI_PREFIX}-countdown">
+            <span>快取倒數（輸入框右上角）</span>
+          </label>
+          <small>快取熱著的時候，下一則只算新的部分、便宜很多；冷掉之後要整包重建。打勾後輸入框右上角會有一顆小膠囊倒數，點它看說明。能活多久（1 小時或 5 分鐘）是照每一則實際的回報讀的，不同方案會不一樣。這格只管顯示——取消勾選只是膠囊不見，快取照樣在省（省不省是下面「拆塊省快取」那格在管）。</small>
+          <div class="${UI_PREFIX}-cache-note" id="${UI_PREFIX}-cachetimer-line"></div>
+        </div>
         <div class="${UI_PREFIX}-option">
           <label class="checkbox_label">
             <input type="checkbox" id="${UI_PREFIX}-split">
@@ -224,6 +351,16 @@ function buildPanel() {
       settings.sdkThinking = thinkingEl.checked;
       getCtx()?.saveSettingsDebounced?.();
       syncConfig();
+    });
+  }
+
+  const countdownEl = drawer.querySelector(`#${UI_PREFIX}-countdown`);
+  if (countdownEl) {
+    countdownEl.checked = settings.cacheCountdown !== false;
+    countdownEl.addEventListener('change', () => {
+      settings.cacheCountdown = countdownEl.checked;
+      getCtx()?.saveSettingsDebounced?.();
+      renderCacheTimer();
     });
   }
 
@@ -704,6 +841,14 @@ export async function init() {
   if (ctx?.eventSource && presetChanged) {
     ctx.eventSource.on(presetChanged, syncConfig);
   }
+
+  // 快取倒數（v1.9.11）：收到回覆問後端一次；換聊天重畫（倒數屬於上一個聊天就藏起來）
+  const 收到回覆 = ctx?.eventTypes?.MESSAGE_RECEIVED;
+  const 換聊天 = ctx?.eventTypes?.CHAT_CHANGED;
+  if (ctx?.eventSource && 收到回覆) ctx.eventSource.on(收到回覆, () => { refreshCacheTimer({ fromReply: true }); });
+  if (ctx?.eventSource && 換聊天) ctx.eventSource.on(換聊天, () => { renderCacheTimer(); });
+  startCacheTimer();
+  refreshCacheTimer();
 
   console.log(`[${PLUGIN_ID}] Frontend initialized.`);
 }

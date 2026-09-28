@@ -126,6 +126,37 @@ const cacheHistory = [];
 // 只算輸入側：輸出不受快取影響，混進去會把倍數稀釋成看不懂的數字。
 // 參數只給測試用（預設就是真的累計器）——讓測試餵假數字進來驗**這支本尊**的算法，
 // 不必為了可測而另寫一份複製品（複製品測過 ≠ 本體會動）。
+// 快取倒數（26-09-29 v1.9.11，Mini 從 coralline 狀態列的「快取」段偷師：「如果有開啟的話可以在一個小欄位出現快取倒數」）。
+// 面板一小格告訴玩家「這個聊天的快取還有多久冷掉」——還熱著就趕快回，冷了下一則比較貴是正常的。
+// ① 壽命不猜方案：每一發回報的 usage.cache_creation 分 ephemeral_1h／ephemeral_5m，照讀。
+//    Mini 帳號實測全是 1 小時；聽說 20 美元方案是 5 分鐘，沒帳號可驗——照讀就兩種都對。
+// ② 純命中（只讀沒寫）的那發回報裡沒有壽命 → 沿用上次量到的（同帳號不變），標 remembered；沒量過就 null，不猜。
+// ③ 起算點用送出時間（ctx.startedAtMs）：快取是送出時續命的，拿收完時間算會多報幾十秒，倒數寧短勿長。
+let lastKnownTtlSec = null;
+let lastCacheTimer = null;
+function cacheTtlOf(usage) {
+  const cc = usage?.usage?.cache_creation;
+  if (!cc || typeof cc !== 'object') return null;
+  if ((cc.ephemeral_1h_input_tokens || 0) > 0) return 3600;   // 兩種都有時取 1 小時：大段是那份
+  if ((cc.ephemeral_5m_input_tokens || 0) > 0) return 300;
+  return null;
+}
+function noteCacheTimer(usage, ctx, cacheRead, cacheWrite) {
+  const reported = cacheTtlOf(usage);
+  if (reported) lastKnownTtlSec = reported;
+  const ttlSec = reported ?? lastKnownTtlSec;
+  const startedAtMs = ctx.startedAtMs ?? Date.now();
+  lastCacheTimer = {
+    convKey: ctx.convKey ?? null,
+    warm: cacheRead > 0 || cacheWrite > 0,
+    ttlSec,
+    ttlSource: reported ? 'reported' : ttlSec ? 'remembered' : null,
+    startedAtMs,
+    expiresAtMs: ttlSec ? startedAtMs + ttlSec * 1000 : null,
+  };
+}
+function _resetCacheTimer() { lastKnownTtlSec = null; lastCacheTimer = null; }
+
 function cacheSummary(t = cacheTally) {
   const actual = t.input + t.cacheRead * 0.1 + t.cacheWrite * 2;
   const noCache = t.input + t.cacheRead + t.cacheWrite;
@@ -172,6 +203,9 @@ function cacheSummary(t = cacheTally) {
     // null＝沒有連續漂到門檻，前端整段不顯示（**沒漂的人不該看到任何指認**，見 sysDriftAdvice 的守門註解）。
     sysDriftStreak: t.lastSysDriftStreak ?? null,
     sysDriftAdvice: t.lastSysDriftAdvice ?? null,
+    // 26-09-29 v1.9.11 快取倒數：只有真帳本才帶（測試傳假帳本時不混進全域狀態）；後端現在時間一起給，前端拿它抵銷時鐘差
+    cacheTimer: t === cacheTally ? lastCacheTimer : null,
+    serverNowMs: Date.now(),
   };
 }
 
@@ -797,6 +831,7 @@ function recordUsage(usage, ctx) {
     if (cacheHistory.length > CACHE_HISTORY_MAX) cacheHistory.shift();
     // 這一發真的送到了 → 它才有資格當下一發的比較基準（見 pendingTurnFps 註解）
     commitTurnBaseline();
+    noteCacheTimer(usage, ctx, cacheRead, cacheWrite);   // 26-09-29 v1.9.11 快取倒數
     if (ctx.splitApplied) cacheTally.splitApplied++;
     // 不拆的理由要留最後一筆——面板的警告靠它把「沒生效」講成「為什麼沒生效」。
     else if (ctx.splitReason) cacheTally.lastSkipReason = ctx.splitReason;
@@ -2044,11 +2079,12 @@ async function resolveUsage(absorbed, q) {
  * 欄位集合由 record-usage-parity.test 釘住——加欄位加在這裡，兩條路同時拿到。
  */
 export function usageCtx(base, { mode, aborted = false, suffix = aborted ? ' (讓位/斷線)' : '' } = {}) {
-  const { reqNo, modelId, effort, shape, imgCount, costUsd, splitInfo, evaluated, systemDrift, comp } = base;
+  const { reqNo, modelId, effort, shape, imgCount, costUsd, splitInfo, evaluated, systemDrift, comp, startedAtMs } = base;
   // 26-09-03（CX-260903-01 ③）：連續漂移的計數與建議句。句子在後端組好——
   // 前端 import 不到後端函式，兩邊各組一次遲早各說各話（跟 lastCompLine 同一條紀律）。
   return {
     reqNo, mode, modelId, effort, shape, imgCount, costUsd,
+    startedAtMs,   // 26-09-29 v1.9.11：快取倒數的起算點（送出時間）
     // 26-09-02（審核 A4）：帳上要看得出這發被打斷（console 後綴＋cache-log 的 aborted），兩條路都帶
     aborted, suffix,
     splitApplied: splitInfo.applied,
@@ -2395,7 +2431,7 @@ async function handleChatCompletions(req, res) {
             : prompt
     );
     // recordUsage 的材料，兩條路共用；reqNo／costUsd 要等收尾才知道，呼叫時再補
-    const ctxBase = { modelId, effort: configEffort, shape, imgCount: hasImages ? images.length : 0, splitInfo, evaluated, systemDrift, comp, sysDriftStreak: sysStreak.streak, sysDriftAdvice: 漂移建議 };
+    const ctxBase = { startedAtMs: Date.now(), modelId, effort: configEffort, shape, imgCount: hasImages ? images.length : 0, splitInfo, evaluated, systemDrift, comp, sysDriftStreak: sysStreak.streak, sysDriftAdvice: 漂移建議 };
 
     // 讓位期間（await releaseCurrent）酒館若已斷線，這裡再擋一次——SDK 一發都別燒
     if (ticket.aborted) return;
@@ -2899,4 +2935,4 @@ function _setQueryFn(fn) { queryFn = fn; }
 // （複製品測過≠本體會動，26-08-01 只改非串流那份的同族教訓）
 // applyConfig／recordUsage 也 export（26-09-02 wave2-ε）：turn-trace 測 /config 的 trace 欄、cache-stats 測 recordUsage → cacheRoi 的價目接線——測本尊，不抄副本。
 // sysInFirstTurnEnabled（26-09-02 第二波 b ③）：split-toggle 測 /config 的 sysInFirstTurn 欄要驗本尊
-export { info, init, exit, parseMessages, thinkingOption, handleChatCompletions, _setQueryFn, traceTurns, splitPromptBlocks, makeSplitPrompt, splitEnabled, sysInFirstTurnEnabled, cacheSummary, applyConfig, recordUsage };
+export { info, init, exit, parseMessages, thinkingOption, handleChatCompletions, _setQueryFn, traceTurns, splitPromptBlocks, makeSplitPrompt, splitEnabled, sysInFirstTurnEnabled, cacheSummary, applyConfig, recordUsage, _resetCacheTimer };
