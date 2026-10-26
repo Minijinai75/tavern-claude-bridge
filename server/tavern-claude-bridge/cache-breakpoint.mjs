@@ -951,6 +951,55 @@ export function sysDriftAdvice(streak, idx) {
     + `**改完再玩一則、回來看這句還在不在**：有些深度注入設定仍然會落回系統提示區，這句消失了才算真的搬走。`;
 }
 
+/** 「可見歷史該壓到幾則」的緩衝：量到裝得下 X 則，建議壓到 X×(1−緩衝)。每則長度會變、下一則可能更長，貼著上限壓照樣會再滑。 */
+export const HISTORY_ADVICE_BUFFER = 0.15;
+
+/**
+ * 可見歷史該壓到幾則（26-10-15 承曦｜CX-260905-01，v1.9.13）。回 null＝不出聲。
+ *
+ * 方向（26-09-05 13:24 凌敘擋下原版後改寫定案）：**縮小可見歷史，不是放大預算。**
+ * 酒館填歷史的邏輯是「只要還有預算就繼續塞」（openai.js 的 ChatCompletion 預算：max_context − max_tokens），
+ * 所以送出的對話則數不是輸入、是結果：可見歷史比預算裝得下的多，每一則都會從最舊的一頭掉幾則（convOffset>0），
+ * 對話流前綴每發不同、快取讀不到。放大預算只是讓更多歷史擠進來、每一則重寫更多、更貴，照樣頂穿照樣滑。
+ * 只要可見歷史 < 裝得下的量，酒館塞完就沒得塞，前綴才會固定。
+ *
+ * 守門（沿用 1.9.3 的教訓）：**只在實測到頂穿（convOffset > 0）時出口**。對話短、沒滑動的人不該看到任何指認。
+ * 算法只用量得到的數字：
+ *   - 裝得下幾則＝這一發真的送出的對話則數（comp.dlg.n）。頂穿時它就是預算塞得下的量，不用再估 tokenizer。
+ *   - 固定開銷＝系統區＋注入區的字元佔比（comp 已有）；給了這一發的實測輸入 token 總數就按比例換成 token 數。
+ *   - 建議值留緩衝（HISTORY_ADVICE_BUFFER），至少 1 則。
+ *   - 預算（maxContext − maxTokens）由前端讀酒館 oai_settings 經 /config 送來；沒送就不印預算那句，其餘照算。
+ * 句子在這裡組好，前端只印——前端 import 不到後端函式，兩邊各組一次遲早各說各話（跟 sysDriftAdvice 同一條紀律）。
+ * 措辭要講清楚代價：模型看得到的前情變少。那是使用者的體驗取捨，不是我們替他決定的。
+ */
+export function historyBudgetAdvice({ comp, convOffset, inputTotal, maxContext, maxTokens } = {}) {
+  if (!(typeof convOffset === 'number' && convOffset > 0)) return null;
+  if (!comp || !comp.sys || !comp.dlg || !comp.inj) return null;
+  const capacity = Number.isInteger(comp.dlg.n) ? comp.dlg.n : 0;
+  if (capacity <= 0) return null;
+  const sysChars = comp.sys.chars || 0, dlgChars = comp.dlg.chars || 0, injChars = comp.inj.chars || 0;
+  const totalChars = sysChars + dlgChars + injChars;
+  if (totalChars <= 0) return null;
+  const fixedChars = sysChars + injChars;
+  const fixedPct = Math.round((fixedChars / totalChars) * 100);
+  const suggest = Math.max(1, Math.floor(capacity * (1 - HISTORY_ADVICE_BUFFER)));
+  const 正數 = v => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null);
+  const ctx = 正數(maxContext);
+  const reply = 正數(maxTokens);
+  const budget = ctx ? Math.max(0, ctx - (reply || 0)) : null;
+  const sent = 正數(inputTotal);
+  const fixedTok = sent ? Math.round((sent * fixedChars) / totalChars) : null;
+  const k = n => n.toLocaleString('en-US');
+  const text = `這一則的對話又從最舊的一頭掉了 ${convOffset} 則——不是換聊天，是酒館的上下文預算裝滿了，塞不下的舊樓層被擠出去。`
+    + (budget ? `你的上下文上限 ${k(ctx)} 扣掉留給回覆的 ${k(reply || 0)}＝預算 ${k(budget)} tokens；` : '')
+    + `固定開銷（角色卡＋系統提示＋世界書等注入）吃掉約 ${fixedPct}%${fixedTok ? `（約 ${k(fixedTok)} tokens）` : ''}，`
+    + `對話大概只裝得下 ${capacity} 則。`
+    + `要它不再每則滑動，把可見歷史壓到 ${suggest} 則上下（在酒館用 /hide 把最舊的樓層藏起來，留一點緩衝）。`
+    + `代價是模型看得到的前情變少——這是你的取捨，不是設定錯了。`
+    + `**不要去放大上下文上限**：放大只會讓更多歷史擠進來、每一則重寫更多、更貴，照樣塞滿照樣滑。`;
+  return { convOffset, capacity, suggest, fixedPct, fixedTok, budget, sent, text };
+}
+
 /** 面板／console 那一行。數字取自 summary，不另外算——兩處各算一次遲早各說各話。 */
 export function composeLine(summary) {
   if (!summary) return '';

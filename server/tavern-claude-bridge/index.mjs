@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 // 拆塊斷點掃描器（26-08-02，CX-260802-03）：只做「斷點該落在哪一則」的計算，
 // 不碰渲染也不貼標記——分工線在那支的檔頭註解。目前只被量測模式用到。
-import { fingerprintTurns, lengthsOfTurns, kindsOfTurns, alignDialogue, CONV_OVERLAP_MIN_RATIO, CONV_OVERLAP_MIN_RUN, CONV_OVERLAP_STRONG_RUN, decideBreakpoint, stickyBreakpoint, meetsCacheMinimum, estimateTokens, minCacheTokensFor, trackSystemPrompt, analyzeShift, cacheRoi, shortDiff, textOfTurn, composeTurns, composeLine, kindOfTurn, sysDriftAdvice } from './cache-breakpoint.mjs';
+import { fingerprintTurns, lengthsOfTurns, kindsOfTurns, alignDialogue, CONV_OVERLAP_MIN_RATIO, CONV_OVERLAP_MIN_RUN, CONV_OVERLAP_STRONG_RUN, decideBreakpoint, stickyBreakpoint, meetsCacheMinimum, estimateTokens, minCacheTokensFor, trackSystemPrompt, analyzeShift, cacheRoi, shortDiff, textOfTurn, composeTurns, composeLine, kindOfTurn, sysDriftAdvice, historyBudgetAdvice } from './cache-breakpoint.mjs';
 
 // ESM 沒有 __dirname，自己算（快取讀數落檔要用——見 appendCacheLog）
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -87,7 +87,66 @@ const HOST = '127.0.0.1';
 
 let bridgeServer = null;
 let queryFn = null;
-let current = null; // 正在跑的那一則；新請求進來會請它讓位
+// 正在跑的每一則（26-10-26 v1.9.14 多張票）。以前是單一槽位 `current`：新請求一進來就請它讓位——
+// 酒館擴充在背景另外發請求（總結、狀態追蹤）時，玩家正在看的正文就被砍掉（沐晴實機發現）。
+// 現在每一則一張票，誰能取消誰由 releaseOrphans() 決定，busy＝有任何一張票還在。
+// 票的欄位：id／q（SDK query）／aborted（迴圈該收了）／disconnected（酒館端斷線＝孤兒）／
+//           convKey（哪一段聊天）／stopping（停過一次的 promise，防重複停）／supersededBy（被哪張票讓位）／
+//           baseline（這一發的快取基準暫存，成功才提交，見 takePendingBaseline）
+const inflight = new Set();
+let ticketSeq = 0;
+
+// 同時跑則數的軟上限（26-10-26 v1.9.14 收尾，Mini 派工：預設 4、寫成設定值、超過的排隊不回 429）。
+// 為什麼要有：多張票之後背景請求不再被擠掉，但也沒人管「一次開幾個 Claude Code 子程序」——
+// 擴充一口氣發一串背景請求時，同時燒好幾份額度、本機也同時跑好幾個子程序。
+// 為什麼是排隊不是 429：429 會讓酒館那頭直接報錯、那則就沒了；排隊只是晚一點開始，前面任一則收尾就接上。
+// 只算**還連著、沒被停的**票（!aborted）：斷線正在收尾的孤兒不佔名額——孤兒的 return() 可能卡到下一個事件才生效，
+// 讓它佔名額的話，一則卡住的孤兒就能把後面排隊的人全吊住。
+// 設定：啟動前設環境變數 TCB_MAX_INFLIGHT（正整數），沒設或亂設就用預設值。每次請求現讀（跟 TCB_JUMP_GAIN 同手法）。
+const MAX_INFLIGHT_DEFAULT = 4;
+export function maxInflight() {
+  const n = parseInt(process.env.TCB_MAX_INFLIGHT, 10);
+  return Number.isFinite(n) && n >= 1 ? n : MAX_INFLIGHT_DEFAULT;
+}
+const queued = new Set();     // 排隊中的票（還沒登記進 inflight）
+let slotWaiters = [];         // 排隊者的喚醒函式；名額可能空出來時全叫醒、各自重查（誰先醒誰先拿，醒來順序＝排隊順序）
+function liveCount() {
+  let n = 0;
+  for (const t of inflight) if (!t.aborted) n++;
+  return n;
+}
+// 名額可能空出來的兩個時刻都要叫：一張票收尾（finally）、一張票被停（stopTicket：它從此不算佔名額）。
+// 排隊中的票自己斷線也走 stopTicket——叫醒之後它看到自己 aborted 就離隊，不會吊著等名額。
+function wakeSlotWaiters() {
+  const ws = slotWaiters;
+  slotWaiters = [];
+  for (const w of ws) w();
+}
+// 拿名額：有空位就**同步**登記進 inflight 回 true；沒空位回 false，呼叫端改 await waitForSlot()。
+function tryTakeSlot(ticket) {
+  if (liveCount() >= maxInflight()) return false;
+  inflight.add(ticket);
+  return true;
+}
+// 排隊等名額。醒來重查到登記進 inflight 之間**沒有 await**——不然兩個同時醒的排隊者會一起擠進同一個空位。
+// 自己斷線（aborted）就直接離隊、不登記，呼叫端看到 aborted 就收手，SDK 一發都不燒。
+async function waitForSlot(ticket) {
+  queued.add(ticket);
+  console.log(`[${PLUGIN_ID}] 排隊：同時已有 ${liveCount()} 則在跑（上限 ${maxInflight()}，可用 TCB_MAX_INFLIGHT 調），等前面任一則收尾就接上。`);
+  try {
+    while (!ticket.aborted && liveCount() >= maxInflight()) {
+      await new Promise(r => slotWaiters.push(r));
+    }
+    if (!ticket.aborted) inflight.add(ticket);
+  } finally {
+    queued.delete(ticket);
+  }
+}
+
+/** busy＝有任何一則在跑或在排隊（含斷線後還在背景收尾的孤兒）；inflight＝同時幾則；queued＝排隊中幾則。/health 與 /status 共用這一支。 */
+export function bridgeLoad() {
+  return { busy: inflight.size > 0 || queued.size > 0, inflight: inflight.size, queued: queued.size };
+}
 let totalCostUsd = 0;
 let requestCount = 0;
 
@@ -203,6 +262,9 @@ function cacheSummary(t = cacheTally) {
     // null＝沒有連續漂到門檻，前端整段不顯示（**沒漂的人不該看到任何指認**，見 sysDriftAdvice 的守門註解）。
     sysDriftStreak: t.lastSysDriftStreak ?? null,
     sysDriftAdvice: t.lastSysDriftAdvice ?? null,
+    // 26-10-15 v1.9.13（CX-260905-01）：「可見歷史該壓到幾則」（historyBudgetAdvice 的整包：text＋數字）。
+    // 句子在後端組、前端只印。null＝這發沒頂穿（convOffset 不是正數），前端整格不出現——**沒滑動的人不該看到任何指認**。
+    historyAdvice: t.lastHistoryAdvice ?? null,
     // 26-09-29 v1.9.11 快取倒數：只有真帳本才帶（測試傳假帳本時不混進全域狀態）；後端現在時間一起給，前端拿它抵銷時鐘差
     cacheTimer: t === cacheTally ? lastCacheTimer : null,
     serverNowMs: Date.now(),
@@ -254,19 +316,39 @@ function splitWarningOf(t) {
 }
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 
-// 讓前一則停下來。26-07-25 改：原本「同時只准一個、後來的回 429」，
-// 在 RP 場景是錯的——玩家按重新生成/停止時，想要的是「換一則」不是「排隊」，
-// 而酒館超時斷線後舊的還在跑，重試就一直吃 429（實際使用時踩到）。
-// interrupt() 官方註明只在串流輸入模式可用（我們是單次字串輸入），所以兩段式：
+// 讓一張票停下來。interrupt() 官方註明只在串流輸入模式可用（我們多半是單次字串輸入），所以兩段式：
 // 先試 interrupt、退而求其次 return()，都失敗就靠 aborted 旗標讓迴圈自己收。
-async function releaseCurrent(reason) {
-  const prev = current;
-  if (!prev) return;
-  current = null;
-  prev.aborted = true;
-  try { await prev.q?.interrupt?.(); } catch {}
-  try { await prev.q?.return?.(); } catch {}
-  console.log(`[${PLUGIN_ID}] 前一則讓位（${reason}）`);
+// **一張票只停一次**（26-10-26）：斷線與讓位可能落在同一張票上（玩家按停止、接著按重新生成），
+// 以前兩條路各停一次＝interrupt／return 各打兩發。第二次起直接回第一次那個 promise。
+// 不 await 它：新請求不必等舊的真的停完才開始（SDK 的 return 可能要等下一個事件才生效）。
+function stopTicket(t) {
+  t.aborted = true;
+  wakeSlotWaiters();   // 被停的票不再佔名額（見 liveCount）；排隊中的票自己斷線也靠這一聲離隊
+  if (t.stopping) return t.stopping;
+  t.stopping = Promise.resolve()
+    .then(() => t.q?.interrupt?.())
+    .catch(() => {})
+    .then(() => t.q?.return?.())
+    .catch(() => {});
+  return t.stopping;
+}
+
+// 誰能取消誰（26-10-26 v1.9.14，Mini 面板拍板「只讓同一段聊天」；沐晴實機發現背景請求砍掉正文）。
+// 26-07-25 的舊規則是「新請求一進來，前一則讓位」——那時想的是玩家按重新生成要換一則、不要排隊吃 429。
+// 但酒館擴充會在背景另外發請求（總結、狀態追蹤、quiet prompt），它們一進來就把玩家正在看的正文砍掉。
+//   ① 酒館端還連著的票：**任何新請求都不准取消**，兩則同時跑。
+//   ② 酒館端已斷線的票（孤兒：按停止、手機鎖屏、關頁面）：新請求是同一段聊天 → 照舊讓位；
+//      不是同一段聊天 → 不碰它（它在斷線那一刻已經照原規矩開始停了，見 handleChatCompletions 的 close 監聽）。
+//   這座橋沒有續盤，所以「同題再來」（按停止後重新生成）就是①②的特例：舊的是孤兒、同一段聊天 → 讓位，跟以前一樣。
+// 同一段聊天＝sameConversation(孤兒的 convKey, 新請求的 convKey)，convKey 的算法見 conversationKey()。
+function releaseOrphans(incoming) {
+  for (const t of inflight) {
+    if (t === incoming || !t.disconnected || t.supersededBy) continue;   // ① 連著的誰都不准動
+    if (!sameConversation(t.convKey, incoming.convKey)) continue;        // ② 別段聊天的孤兒不碰
+    t.supersededBy = incoming.id;
+    stopTicket(t);
+    console.log(`[${PLUGIN_ID}] 前一則讓位（同一段聊天的新請求進來；那則的酒館端已斷線）`);
+  }
 }
 
 // 'auto'＝完全不送 effort，交給 SDK 的 adaptive 自己決定。
@@ -378,12 +460,18 @@ function traceEnabled() { return configTrace || process.env.TCB_TURN_TRACE === '
 let configSysInFirstTurn = false;
 function sysInFirstTurnEnabled() { return configSysInFirstTurn; }
 
+// 酒館的上下文預算（26-10-15 v1.9.13，CX-260905-01）：前端讀 oai_settings 的 openai_max_context／openai_max_tokens 經 /config 送來，
+// 後端拿它算「可見歷史該壓到幾則」那格的預算句。橋本身收不到這兩個值（酒館送來的請求只帶 max_tokens），所以得由前端給。
+// null＝前端沒送（舊版前端或還沒同步）——那格照樣出口，只少印預算那一句。
+let configMaxContext = null;
+let configMaxTokens = null;
+
 // /config 的讀寫只有這一份實作，兩條路徑（5199 直連與 ST 同源 router）都呼叫它。
 // 26-08-03 抽出來的理由很實際：原本兩邊各寫一份幾乎相同的邏輯，加第三個欄位就要改兩處，
 // 而「改一半」的症狀是安靜的——面板走 router 那條會動，curl 走 5199 那條不動，兩邊都不報錯。
 function currentConfig() {
   // trace 回的是**實際生效值**（面板開 或 環境變數強制開），跟 splitLocked 同一個念頭：面板要看到真相，不是看到自己送過什麼
-  return { effort: configEffort, thinking: configThinking, split: configSplit, splitLocked: SPLIT_LOCKED_OFF, trace: traceEnabled(), sysInFirstTurn: configSysInFirstTurn };
+  return { effort: configEffort, thinking: configThinking, split: configSplit, splitLocked: SPLIT_LOCKED_OFF, trace: traceEnabled(), sysInFirstTurn: configSysInFirstTurn, maxContext: configMaxContext, maxTokens: configMaxTokens };
 }
 
 // 只認得懂的欄位、只吃型別對的值；其餘一律忽略並維持原值（髒資料不該把設定踩回預設）。
@@ -395,6 +483,10 @@ function applyConfig(cfg) {
   if (typeof cfg.split === 'boolean' && !SPLIT_LOCKED_OFF) configSplit = cfg.split;
   if (typeof cfg.trace === 'boolean') configTrace = cfg.trace;   // 26-09-02 ⑨：型別不對就忽略，比照上面三欄
   if (typeof cfg.sysInFirstTurn === 'boolean') configSysInFirstTurn = cfg.sysInFirstTurn;   // 26-09-02 ③：同上
+  // 26-10-15 v1.9.13（CX-260905-01）：酒館上下文預算兩個值。只吃正的有限數字；null 明確清掉（前端讀不到時送 null）；其餘型別忽略
+  const 預算值 = v => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : undefined);
+  if (cfg.maxContext === null) configMaxContext = null; else if (預算值(cfg.maxContext) !== undefined) configMaxContext = 預算值(cfg.maxContext);
+  if (cfg.maxTokens === null) configMaxTokens = null; else if (預算值(cfg.maxTokens) !== undefined) configMaxTokens = 預算值(cfg.maxTokens);
   return currentConfig();
 }
 
@@ -831,7 +923,12 @@ function recordUsage(usage, ctx) {
     cacheHistory.push({ atMs: Date.now(), cacheWrite, cacheRead, model: ctx.modelId });
     if (cacheHistory.length > CACHE_HISTORY_MAX) cacheHistory.shift();
     // 這一發真的送到了 → 它才有資格當下一發的比較基準（見 pendingTurnFps 註解）
-    commitTurnBaseline();
+    // ctx.baseline＝這張票自己的暫存（26-10-26 多張票，見 takePendingBaseline）；沒帶就退回模組暫存（舊用法）
+    // **被同一段聊天的新請求取代的孤兒不提交**（26-10-26 審查 P3①）：新請求不再等孤兒停完，
+    // 孤兒可能比新的那則晚收尾——它那份較舊的指紋／sticky／splitState 會把新的那則剛交的蓋回去，
+    // 下一發拿舊基準比、報出假的變動點，sticky 斷點往回退＝快取白建一次。取代它的那則一定比它新，基準留給那則。
+    // 單純按停止、沒人取代的孤兒照舊提交（它的 prompt 確實到過 API，是最新的一發）。
+    if (!ctx.superseded) commitTurnBaseline(ctx.baseline ?? undefined);
     noteCacheTimer(usage, ctx, cacheRead, cacheWrite);   // 26-09-29 v1.9.11 快取倒數
     if (ctx.splitApplied) cacheTally.splitApplied++;
     // 不拆的理由要留最後一筆——面板的警告靠它把「沒生效」講成「為什麼沒生效」。
@@ -854,6 +951,10 @@ function recordUsage(usage, ctx) {
     // **每發都覆寫，包含 null**——漂移停了建議句就要消失，留著舊句等於對已經修好的人繼續喊病。
     cacheTally.lastSysDriftStreak = ctx.sysDriftStreak ?? null;
     cacheTally.lastSysDriftAdvice = ctx.sysDriftAdvice ?? null;
+    // 26-10-15 v1.9.13（CX-260905-01）：「可見歷史該壓到幾則」。只在這發實測到頂穿（convOffset>0）時才有句子；
+    // **每發都覆寫，包含 null**——使用者把歷史壓下去、不再滑動，這格就要消失（同上一條紀律）。
+    // 預算兩值由前端讀酒館 oai_settings 經 /config 送來；inputTotal 是這發實測的輸入總量，拿來把固定開銷佔比換成 token 數。
+    cacheTally.lastHistoryAdvice = historyBudgetAdvice({ comp: ctx.comp, convOffset: ctx.convOffset, inputTotal, maxContext: configMaxContext, maxTokens: configMaxTokens });
     // 26-09-02（審核 C10d，⑫ 後端半邊）：訂閱使用者付的是 5h 額度不是美元——最近一發**有值**的留給面板。
     // 這一發沒帶（SDK 有些版本不回 rate_limits）就保留上一個有值的，不歸零。
     if (flat.fiveHourPct != null) cacheTally.lastQuota5hPct = flat.fiveHourPct;
@@ -1493,35 +1594,51 @@ export function trackSysDriftStreakPending(sysSummary, sameConv, convSwitched = 
 }
 
 /**
+ * 把這一發寫進模組暫存的那幾格整包取走、暫存清空（26-10-26 v1.9.14 多張票）。
+ *
+ * 為什麼要取走：暫存（pendingTurnFps／pendingSplit／pendingSysDrift…）是全域一份。以前同時只有一則，
+ * 「評估 → 送出 → 成功才提交」中間不會有別人插進來；現在兩則可以同時跑——後評估的那則會把
+ * 前一則的暫存蓋掉，先收尾的那則提交的是別人的指紋、晚收尾的那則手上什麼都沒有。
+ * handleChatCompletions 在評估完、第一個 await 之前呼叫它，把暫存收進自己的票（ticket.baseline），
+ * 收尾時 recordUsage 拿票上那份提交。兩則都成功時**後收尾的那則留下來當基準**（它是最後一個真的到過 API 的）。
+ */
+export function takePendingBaseline() {
+  const snap = {
+    turnFps: pendingTurnFps, turnLens: pendingTurnLens, turnKinds: pendingTurnKinds, turnKey: pendingTurnKey,
+    rewriteSnap: pendingRewriteSnap, sysDrift: pendingSysDrift, split: pendingSplit,
+  };
+  pendingTurnFps = null; pendingTurnLens = null; pendingTurnKinds = null;
+  pendingRewriteSnap = null; pendingSysDrift = null; pendingSplit = null;
+  return snap;
+}
+
+/**
  * 提交這一發的指紋當下一發的基準。**只有請求真的成功才准呼叫**。
  * 失敗的請求不提交——它從來沒到過 API，拿它當基準會讓下一發報出假的變動點。
+ * snap：這一發的暫存（handleChatCompletions 傳票上那份）；不給就取模組暫存（單元測試直接呼叫的舊用法）。
  */
-export function commitTurnBaseline() {
-  if (!pendingTurnFps) return false;
-  prevTurnFps = pendingTurnFps;
-  prevTurnLens = pendingTurnLens;
-  prevTurnKinds = pendingTurnKinds;
-  prevTurnKey = pendingTurnKey;
-  prevRewriteSnap = pendingRewriteSnap;
+export function commitTurnBaseline(snap = takePendingBaseline()) {
+  if (!snap || !snap.turnFps) return false;
+  prevTurnFps = snap.turnFps;
+  prevTurnLens = snap.turnLens;
+  prevTurnKinds = snap.turnKinds;
+  prevTurnKey = snap.turnKey;
+  prevRewriteSnap = snap.rewriteSnap;
   // 這一發成功了 → 這把鑰匙配這份基準，記進「看過的鑰匙」（26-09-03 ①）
   rememberBaseline(prevTurnKey, prevTurnFps, prevTurnLens, prevTurnKinds, prevRewriteSnap);
-  if (pendingSysDrift) {
-    sysDriftStreak = pendingSysDrift.streak;
-    sysDriftIdx = pendingSysDrift.idx;
-    pendingSysDrift = null;
+  if (snap.sysDrift) {
+    sysDriftStreak = snap.sysDrift.streak;
+    sysDriftIdx = snap.sysDrift.idx;
   }
   // sticky／systemHash／systemHashSeen 同一刻提交（26-09-02 A5＋A10）
-  if (pendingSplit) {
-    splitState.sticky = pendingSplit.sticky;
-    splitState.sticky1 = pendingSplit.sticky1 ?? null;
-    splitState.systemHash = pendingSplit.systemHash;
-    splitState.systemHashSeen = pendingSplit.systemHashSeen;
-    pendingSplit = null;
+  if (snap.split) {
+    splitState.sticky = snap.split.sticky;
+    splitState.sticky1 = snap.split.sticky1 ?? null;
+    splitState.systemHash = snap.split.systemHash;
+    splitState.systemHashSeen = snap.split.systemHashSeen;
   }
-  pendingRewriteSnap = null;
-  pendingTurnFps = null;
-  pendingTurnLens = null;
-  pendingTurnKinds = null;
+  // 一份暫存只准提交一次（同一張票不會被記兩次帳，這裡是保險）
+  snap.turnFps = null; snap.sysDrift = null; snap.split = null;
   return true;
 }
 
@@ -2119,6 +2236,10 @@ export function usageCtx(base, { mode, aborted = false, suffix = aborted ? ' (�
     convOverlap: evaluated?.overlap ? { run: evaluated.overlap.run, ratio: Number(evaluated.overlap.ratio.toFixed(3)), prevN: evaluated.overlap.prevN } : null,
     sysDriftStreak: base.sysDriftStreak ?? null,
     sysDriftAdvice: base.sysDriftAdvice ?? null,
+    // 26-10-26（v1.9.14 多張票）：這一發自己的快取基準暫存。兩則同時跑時各提交各的，不拿全域那份（會被另一則蓋掉）
+    baseline: base.baseline ?? null,
+    // 26-10-26（審查 P3①）：這一發是不是被同一段聊天的新請求取代的孤兒——是就不提交基準（見 recordUsage）
+    superseded: !!base.superseded,
   };
 }
 
@@ -2156,9 +2277,8 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  // 票先開、斷線監聽先掛；**讓位與坐上位子都等驗證通過之後**（見下方 releaseCurrent 那段）。
-  // current = ticket 若在讓位之前就設，releaseCurrent 會把自己讓掉。
-  const ticket = { q: null, aborted: false };
+  // 票先開、斷線監聽先掛；**讓位與登記進 inflight 都等驗證通過之後**（見下方 tryTakeSlot／releaseOrphans 那兩段）。
+  const ticket = { id: ++ticketSeq, q: null, aborted: false, disconnected: false, convKey: null, stopping: null, supersededBy: null, baseline: null };
   let completionId = null;   // 兩條路徑與外層 catch 都要用，所以提到 try 外
   let modelId = null;
   // 連線還活著才寫——讓位時 res 還開著，要收尾；酒館自己斷線時 res 已關，寫了也沒人收。
@@ -2182,16 +2302,14 @@ async function handleChatCompletions(req, res) {
     appendCacheLog({ t: new Date().toISOString(), n: requestCount, mode, error: msg });
   };
 
-  // 酒館斷線（超時、按停止、關頁面）→ 立刻放手，別讓下一則卡在門口
+  // 酒館斷線（超時、按停止、關頁面）→ 這張票變孤兒、立刻放手（Claude 橋對孤兒的規矩：斷線就停，7/25 起）。
+  // 孤兒在背景收尾的那一小段還留在 inflight 裡——同一段聊天的新請求進來會再把它標成讓位（stopTicket 只停一次）。
   let finished = false;
   res.on('close', () => {
-    if (finished || ticket.aborted) return;
-    ticket.aborted = true;
-    Promise.resolve()
-      .then(() => ticket.q?.interrupt?.())
-      .catch(() => {})
-      .then(() => ticket.q?.return?.())
-      .catch(() => {});
+    if (finished || ticket.disconnected) return;
+    ticket.disconnected = true;
+    if (ticket.aborted) return;
+    stopTicket(ticket);
     console.log(`[${PLUGIN_ID}] 酒館端斷線，停止生成。`);
   });
 
@@ -2238,23 +2356,33 @@ async function handleChatCompletions(req, res) {
     // 以前這裡照樣 spawn CLI 把 prompt 送出去，API 端多半已計 input tokens，白燒一發。
     if (ticket.aborted) return;
 
-    // 新的一則進來＝玩家要這一則，前一則直接讓位（不再回 429 把人擋在門外；26-07-25 Mini 拍板）。
-    // 26-09-02（審核 A6，Mini 拍板 ⑦）讓位**移到驗證之後**：以前任何 POST 進來先讓位再驗證，
-    // 一個註定回 400／413 的壞請求（監控腳本、瀏覽器預檢、另一個分頁的測試連線）也會把
-    // 正在生成的主回覆殺掉。讓位語義是「玩家要新的一則」，壞請求不是玩家要的那一則。
-    await releaseCurrent('新請求進來');
-    current = ticket;
+    // 拿名額（26-10-26 軟上限，見 maxInflight）：在驗證之後（壞請求不佔名額）、讀上一發基準之前
+    // （parseMessages／evaluateBreakpoint 要讀的是排完隊那一刻最新的基準，不是排隊前的）。
+    // 有空位就同步登記，跟以前一樣不讓出去；沒空位才排隊。排隊中斷線 → 離隊收手，SDK 一發都不燒。
+    if (!tryTakeSlot(ticket)) {
+      await waitForSlot(ticket);
+      if (ticket.aborted) return;
+    }
 
     modelId = requestModel || 'claude-opus-4-6[1m]';
     // ②：救援路徑要拿上一發的指紋判「這則 system 是不是跟著對話移位」；prevTurnKey 讓它自己驗基準是不是同一個對話
     const parsedMsgs = parseMessages(messages, { prevFps: prevTurnFps, prevKey: prevTurnKey });
     const { systemPrompt, prompt, images, headerEnd } = parsedMsgs;
+    ticket.convKey = conversationKey(systemPrompt, messages, headerEnd);
+
+    // 讓位（26-10-26 v1.9.14 改規則，見 releaseOrphans）：連著的票誰都不准取消；斷線的孤兒只讓同一段聊天的新請求取消。
+    // 26-07-25 的「新請求一進來前一則就讓位」被酒館擴充的背景請求打穿——它們一進來就把玩家正在看的正文砍掉。
+    // 26-09-02（審核 A6，Mini 拍板 ⑦）那條照舊：讓位**在驗證之後**，註定回 400／413 的壞請求碰不到任何一張票。
+    // 要先算出 convKey 才知道是不是同一段聊天，所以排在 parseMessages 之後（parseMessages 只讀不寫，排前排後一樣）。
+    releaseOrphans(ticket);   // 票已在上面拿名額時登記進 inflight；releaseOrphans 會跳過自己
+
     // 斷點：量測模式與拆塊模式共用同一次計算（兩邊各算一次會讓第二次拿自己當基準，
     // 見 evaluateBreakpoint 的註解）。兩個開關都關著就完全不算，不付這個成本。
     // 26-09-02（CX-260902-01）：組成表**預設開**，每發都要有「上一發的指紋」可比，所以斷點評估
     // 不再看開關——它本來就是純計算，基準只在請求成功後由 commitTurnBaseline 提交。
     // 拆塊關著時 evaluated 照算但不用來切，只餵組成表與診斷。
-    const evaluated = evaluateBreakpoint(messages, headerEnd, conversationKey(systemPrompt, messages, headerEnd));
+    // 從這裡到 takePendingBaseline() 之間**不准有 await**：這一段寫的是全域暫存，中間讓出去另一則就會插進來蓋掉。
+    const evaluated = evaluateBreakpoint(messages, headerEnd, ticket.convKey);
     // 組成表：每一則是 系統區／對話／注入、多長、跟上一發 同／移位／新。
     // 彙總進 cache-log 與面板，逐則進 turn-log（traceTurns）。指紋沿用 evaluated 算好的，不重算。
     // 為什麼要它：一位使用者的「擴充功能 7,074 token」在酒館面板只有總數、內建子項全是 0——
@@ -2423,6 +2551,9 @@ async function handleChatCompletions(req, res) {
     // 落檔放這裡：要把「開關開了沒／有沒有真的拆／切在哪」寫進同一筆，
     // 讀數沒跳時才分得出「沒貼標記」與「貼了沒作用」——這兩件在 cacheRead 上完全同形。
     traceTurns(messages, headerEnd, requestCount + 1, evaluated, splitInfo, comp);
+    // 這一發寫進全域暫存的東西（指紋、sticky、系統提示雜湊、漂移計數）全部收進自己的票——
+    // 同時跑的另一則之後評估時會重寫暫存，不能讓它蓋到這一發要提交的那份（26-10-26 多張票）。
+    ticket.baseline = takePendingBaseline();
 
     // ③ 開關開：系統提示原樣當 prompt 那則 user 的 content[0]（不貼、不加標記）；有拆時 splitPromptBlocks 已經把它排在第一塊
     const buildPrompt = () => (
@@ -2432,9 +2563,9 @@ async function handleChatCompletions(req, res) {
             : prompt
     );
     // recordUsage 的材料，兩條路共用；reqNo／costUsd 要等收尾才知道，呼叫時再補
-    const ctxBase = { startedAtMs: Date.now(), modelId, effort: configEffort, shape, imgCount: hasImages ? images.length : 0, splitInfo, evaluated, systemDrift, comp, sysDriftStreak: sysStreak.streak, sysDriftAdvice: 漂移建議 };
+    const ctxBase = { startedAtMs: Date.now(), modelId, effort: configEffort, shape, imgCount: hasImages ? images.length : 0, splitInfo, evaluated, systemDrift, comp, sysDriftStreak: sysStreak.streak, sysDriftAdvice: 漂移建議, baseline: ticket.baseline };
 
-    // 讓位期間（await releaseCurrent）酒館若已斷線，這裡再擋一次——SDK 一發都別燒
+    // 送出 SDK 之前酒館若已斷線（或被同一段聊天的新請求讓位），這裡再擋一次——SDK 一發都別燒
     if (ticket.aborted) return;
 
     // 26-09-02（審核 A12，Mini 拍板 ⑧）：stream 缺省走 JSON——OpenAI 規範預設 stream=false。
@@ -2475,7 +2606,7 @@ async function handleChatCompletions(req, res) {
         // 原本拿到了卻沒印也沒傳——診斷不了就只能憑感覺猜「是不是有省到」。
         // 記帳走共用的 recordUsage、ctx 走共用的 usageCtx（串流那條也呼叫同兩支，結構上不可能只改一半）
         const { cacheFields, cacheRead, hitPct, inTok, outTok } = recordUsage(usage, usageCtx(
-          { ...ctxBase, reqNo: requestCount, costUsd }, { mode: 'json', aborted: ticket.aborted }));
+          { ...ctxBase, reqNo: requestCount, costUsd, superseded: !!ticket.supersededBy }, { mode: 'json', aborted: ticket.aborted }));
 
         // 空回覆的黑盒子（26-07-27 外部使用者案）：bridge 原本只記請求不記回應，
         // 模型吐出一片空白時完全沒有線索，使用者只看得到「送出去、回來是空的」。
@@ -2546,7 +2677,7 @@ async function handleChatCompletions(req, res) {
     const roleChunk = makeChunk(completionId, modelId, { role: 'assistant', content: '' }, null);
     res.write(`data: ${JSON.stringify(roleChunk)}\n\n`);
 
-    // 斷線／讓位的處理統一在函式開頭那個 res.on('close') 與 releaseCurrent()，這裡不再另掛
+    // 斷線／讓位的處理統一在函式開頭那個 res.on('close') 與 releaseOrphans()，這裡不再另掛
     try {
       // 26-09-02（審核 A2）：queryFn 呼叫搬進 try。以前在 try 外——SSE 標頭已送出後它若同步拋錯，
       // 會跳到外層 catch，而外層只在 !headersSent 才回應：連線懸掛到酒館超時、終端機一個字都沒有。
@@ -2588,7 +2719,7 @@ async function handleChatCompletions(req, res) {
       requestCount++; counted = true;
       totalCostUsd += costUsd;
       // 串流路徑（酒館的預設路徑）——記帳跟非串流走同一支 recordUsage、同一支 usageCtx
-      recordUsage(usage, usageCtx({ ...ctxBase, reqNo: requestCount, costUsd }, { mode: 'stream', aborted: ticket.aborted }));
+      recordUsage(usage, usageCtx({ ...ctxBase, reqNo: requestCount, costUsd, superseded: !!ticket.supersededBy }, { mode: 'stream', aborted: ticket.aborted }));
 
       // 整輪一個字都沒送出＝空回覆。印黑盒子，並補一則通知取代空白畫面（26-07-27 外部使用者案）。
       // 被讓位／斷線的不算空回覆——那是被打斷，不是模型沒話講。
@@ -2622,7 +2753,8 @@ async function handleChatCompletions(req, res) {
     }
   } finally {
     finished = true;
-    if (current === ticket) current = null; // 已經讓位給新的一則就別誤清人家的位子
+    inflight.delete(ticket);   // 只收自己這張票；別人的票各自在自己的 finally 收（Set.delete 重複呼叫也無害）
+    wakeSlotWaiters();         // 名額空出來了，叫排隊的人重查（26-10-26 軟上限）
   }
 }
 
@@ -2641,7 +2773,7 @@ function startBridge(port) {
 
         if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ status: 'ok', busy: current !== null, effort: configEffort, split: configSplit, requestCount, totalCostUsd, cache: cacheSummary() }));
+          res.end(JSON.stringify({ status: 'ok', ...bridgeLoad(), effort: configEffort, split: configSplit, requestCount, totalCostUsd, cache: cacheSummary() }));
           return;
         }
 
@@ -2890,7 +3022,7 @@ async function init(router) {
       plugin: PLUGIN_ID,
       version: info.version,
       bridge: bridgeServer
-        ? { running: true, host: HOST, port: DEFAULT_PORT, busy: current !== null, effort: configEffort, split: configSplit, splitLocked: SPLIT_LOCKED_OFF, requestCount, totalCostUsd, cache: cacheSummary(), models: MODELS.map(m => m.id) }
+        ? { running: true, host: HOST, port: DEFAULT_PORT, ...bridgeLoad(), effort: configEffort, split: configSplit, splitLocked: SPLIT_LOCKED_OFF, requestCount, totalCostUsd, cache: cacheSummary(), models: MODELS.map(m => m.id) }
         : { running: false },
       sdkAvailable: Boolean(queryFn),
       envWarnings: envWarnings(),   // 26-09-28 v1.9.8：面板靠它顯示 API key 之類的警告

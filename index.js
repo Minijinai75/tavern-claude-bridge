@@ -2,7 +2,7 @@ const PLUGIN_ID = 'tavern-claude-bridge';
 const API_BASE = `/api/plugins/${PLUGIN_ID}`;
 const UI_PREFIX = 'tcb';
 const SETTINGS_KEY = 'tavern_claude_bridge';
-const LOCAL_VERSION = '1.9.12';
+const LOCAL_VERSION = '1.9.14';
 const GITHUB_RELEASE_API = 'https://api.github.com/repos/Minijinai75/tavern-claude-bridge/releases/latest';
 let updateCache;
 
@@ -510,6 +510,16 @@ function buildPanel() {
       cacheEl.appendChild(指);
     }
 
+    // 「你的歷史該壓到幾則」（26-10-15 v1.9.13，CX-260905-01）。句子由後端組（cacheSummary().historyAdvice.text），這裡只印。
+    // 後端只在**這一發實測到頂穿（對話從最舊一頭掉了幾則）**時才給這格；對話短、沒滑動的人整格不出現——沒滑的人不該看到任何指認。
+    // 方向是「縮小可見歷史」不是「放大預算」（26-09-05 凌敘擋下原版後定案）：放大只會讓更多歷史擠進來、更貴、照樣滑。
+    if (c.historyAdvice && c.historyAdvice.text) {
+      const 壓 = document.createElement('div');
+      壓.className = `${UI_PREFIX}-cache-warn`;
+      壓.textContent = `📏 ${c.historyAdvice.text}`;
+      cacheEl.appendChild(壓);
+    }
+
     // ── 細節收進摺疊：回報用的證據，不是給人讀的第一句 ──────────────
     const 細節 = document.createElement('details');
     const 摘要 = document.createElement('summary');
@@ -611,6 +621,8 @@ function buildPanel() {
       c.lastSystemDrift ? `⚠️ 系統提示漂移：${漂移短句(c)}` : '',
       // 連續漂移的指名建議也要進剪貼簿（26-09-03 ④）——最需要回報的那一句不能只活在畫面上
       c.sysDriftAdvice ? `⚠️ ${c.sysDriftAdvice}` : '',
+      // 歷史該壓到幾則也進剪貼簿（26-10-15 v1.9.13）——回報時最需要的就是這句跟它的數字
+      c.historyAdvice && c.historyAdvice.text ? `📏 ${c.historyAdvice.text}` : '',
       c.cacheRoi && c.cacheRoi.verdict !== 'unknown'
         ? `快取回本判定：${c.cacheRoi.verdict}`
           + (c.cacheRoi.extraUsd == null || c.cacheRoi.savedUsd == null
@@ -727,7 +739,10 @@ function buildPanel() {
     }
 
     if (b.busy) {
-      infoEl.textContent = '正在處理請求…';
+      // v1.9.14：同時可以跑好幾則（酒館擴充的背景請求不再擠掉正文），兩則以上就把數字講出來
+      // 超過同時上限（預設 4）的請求在排隊，也講出來——不然看起來像橋卡住
+      infoEl.textContent = (b.inflight > 1 ? `同時處理 ${b.inflight} 則請求…` : '正在處理請求…')
+        + (b.queued > 0 ? `（另有 ${b.queued} 則排隊中）` : '');
     } else {
       infoEl.textContent = `已處理 ${b.requestCount} 個請求`;
     }
@@ -759,6 +774,14 @@ function buildPanel() {
 // Auto＝照酒館原生語義「不傳送推理耗費等級」，交給模型自己拿捏（思考本身不受影響，仍是開的）
 const EFFORT_MAP = { auto: 'auto', min: 'low', low: 'low', medium: 'medium', high: 'high', max: 'max' };
 
+// 酒館的上下文預算兩個值（26-10-15 v1.9.13，CX-260905-01）。只回正的有限數字，其餘回 null——
+// 後端只認正數，送 null 等於「清掉」，不會把舊值留著騙人。
+function 讀酒館預算() {
+  const s = getCtx()?.chatCompletionSettings;
+  const 正數 = v => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null);
+  return { maxContext: 正數(s?.openai_max_context), maxTokens: 正數(s?.openai_max_tokens) };
+}
+
 // 一次送齊整份設定（effort＋原生思考開關）。26-07-27 從 syncEffort 擴寫：
 // 後端的設定是記憶體變數、重啟即回預設，所以每次前端有動作就把整份現況推過去，
 // 不做「只推有變的那個」——省不了多少，卻會讓兩邊在重啟後靜靜地不一致。
@@ -766,6 +789,10 @@ async function syncConfig() {
   const el = document.getElementById('openai_reasoning_effort');
   const effort = el ? (EFFORT_MAP[el.value] || 'auto') : 'auto';
   const settings = loadSettings();
+  // 26-10-15 v1.9.13（CX-260905-01）：酒館的上下文預算（上限＋留給回覆的量）一起推給後端，
+  // 「可見歷史該壓到幾則」那格靠它印預算句。出處＝ getContext().chatCompletionSettings（就是 openai.js 的 oai_settings）。
+  // 讀不到就送 null——後端那格照樣出口，只少印預算那一句。
+  const 預算 = 讀酒館預算();
   try {
     // 走 ST 的 plugin router（同源）——直連 127.0.0.1:5199 會被瀏覽器 CORS 擋掉
     const res = await fetch(`${API_BASE}/config`, {
@@ -777,6 +804,8 @@ async function syncConfig() {
         split: !!settings.cacheSplit,
         trace: !!settings.turnTrace,
         sysInFirstTurn: !!settings.sysInFirstTurn,
+        maxContext: 預算.maxContext,
+        maxTokens: 預算.maxTokens,
       }),
     });
     if (!res.ok) { console.warn(`[${PLUGIN_ID}] 設定同步失敗：HTTP ${res.status}`); return null; }
@@ -840,6 +869,12 @@ export async function init() {
   const presetChanged = ctx?.eventTypes?.OAI_PRESET_CHANGED_AFTER;
   if (ctx?.eventSource && presetChanged) {
     ctx.eventSource.on(presetChanged, syncConfig);
+  }
+  // 26-10-15 v1.9.13（CX-260905-01）：她在酒館拉「上下文長度」「最大回應長度」滑桿時，預算要跟著推過去
+  // （換預設檔那條上面已掛；這裡補手動拉桿那條，用 change 不用 input——拉一下觸發幾十次不划算）
+  for (const id of ['openai_max_context', 'openai_max_tokens']) {
+    const 桿 = document.getElementById(id);
+    if (桿) 桿.addEventListener('change', syncConfig);
   }
 
   // 快取倒數（v1.9.11）：收到回覆問後端一次；換聊天重畫（倒數屬於上一個聊天就藏起來）
