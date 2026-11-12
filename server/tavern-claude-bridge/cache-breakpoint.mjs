@@ -130,9 +130,12 @@ export const PRICE_PER_MTOK = {
  *   凌敘從真實帳單反推的 Opus 4.6 那組（上面）跟表對得上，兩邊互相印證。
  *
  * 比對用前綴（startsWith）：橋預設的 modelId 是 'claude-opus-4-6[1m]' 這種帶後綴的字串。
- * **順序有意義**：長的排前面（fable-5-1 要在 fable-5 之前）。
+ * **順序有意義**：長的排前面（fable-5-2、fable-5-1 要在 fable-5 之前）。
  */
 export const PRICE_TABLE = [
+  // 26-11-12 官方確認：輸入 $8、輸出 $40；5m 寫 $10、1h 寫 $16、讀 $0.20 / MTok。橋採 1h。
+  // https://platform.claude.com/docs/en/about-claude/pricing
+  { match: 'claude-fable-5-2',  input: 8,  output: 40, writeMul: 2, readMul: 0.025 },
   { match: 'claude-fable-5-1',  input: 10, output: 50, writeMul: 2, readMul: 0.025 },
   { match: 'claude-fable-5',    input: 10, output: 50, writeMul: 2, readMul: 0.1 },
   { match: 'claude-opus-5-5',   input: 4,  output: 20, writeMul: 2, readMul: 0.05 },  // 26-09-23：讀 $0.20/MTok；必須排在 opus-5 前面，不然前綴比對會把它算成 Opus 5
@@ -175,7 +178,7 @@ export function priceFor(modelId) {
  *
  * 價目（26-09-02）：按 modelId 查表——opts.modelId 優先，沒給就看帳本最後一筆的 model／modelId 欄，
  * 都沒有就沿用 Opus 4.6（DEFAULT_PRICE_MODEL，舊行為）。**有給但查不到** → extraUsd／savedUsd 回 null，
- * 面板只印 token 不印 US$。verdict 不靠美元、靠倍率（各模型新建 2×／讀 0.1× 結構相同，Fable 5.1 讀 0.025×），
+ * 面板只印 token 不印 US$。verdict 不靠美元、靠倍率（各模型新建 2×／讀 0.1× 結構相同，Fable 5.1／5.2 讀 0.025×），
  * 所以查不到價目也照樣下得了判斷。
  *
  * 四檔判定（26-09-02 審核 C10a 加 wasted_heavy）：
@@ -529,6 +532,8 @@ export const CACHE_MIN_TOKENS = {
   'claude-sonnet-5-5': 512,   // 26-09-29 官方 prompt-caching 頁：Sonnet 5.5 是 512（**不是** Sonnet 5 的 1024）；沒列會退到最嚴的 4096
   'claude-opus-5-5': 512,   // 26-09-23 比照 Opus 5 填；26-09-29 官方 prompt-caching 頁已列 512，確認
   'claude-opus-5': 512,
+  // 26-11-12：https://platform.claude.com/docs/en/build-with-claude/prompt-caching#cache-limitations
+  'claude-fable-5-2': 512,
   'claude-fable-5-1': 512,   // 26-09-02：同 Fable 5 家族，未另查到不同數字
   'claude-fable-5': 512,
   'claude-mythos-5': 512,
@@ -578,7 +583,7 @@ export function minCacheTokensFor(modelId) {
  * 新 tokenizer 產的 token 只會更多，1.0 對它們仍是下界、不會把不夠的說成夠。要往上調（例如新家族 1.3）
  * 得先用 count_tokens 對中文 RP 樣本實測，拿到數字再填——猜一個往上的數字會讓門檻閘變寬鬆，那是錯的方向。
  * 值＝「一個 CJK 字算幾 token」的原始係數；安全折 TOKEN_ESTIMATE_SAFETY 另外打，所以有效係數＝1.0 × 0.9 ＝ 0.9（現行）。
- * 比對用前綴（startsWith），`[1m]` 尾綴先剝；**長的排前面**（fable-5-1 在 fable-5 之前）。
+ * 比對用前綴（startsWith），`[1m]` 尾綴先剝；**長的排前面**（fable-5-2、fable-5-1 在 fable-5 之前）。
  */
 export const CJK_TOKENS_PER_CHAR = {
   default: 1.0,
@@ -596,6 +601,7 @@ export const CJK_TOKENS_PER_CHAR = {
   'claude-sonnet-5-5': 1.0,   // 26-09-29 新 tokenizer 家族，1.0 是下界
   'claude-opus-5': 1.0,
   'claude-sonnet-5': 1.0,
+  'claude-fable-5-2': 1.0,   // 26-11-12：沿用 5.1 的保守估算係數；未量測 CJK tokenizer，不宣稱是官方數值
   'claude-fable-5-1': 1.0,
   'claude-fable-5': 1.0,
   'claude-mythos-5-1': 1.0,

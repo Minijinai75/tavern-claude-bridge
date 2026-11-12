@@ -2,6 +2,7 @@ import http from 'node:http';
 import { randomUUID, createHash } from 'node:crypto';   // createHash：對話識別雜湊用（conversationKey）
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 // 拆塊斷點掃描器（26-08-02，CX-260802-03）：只做「斷點該落在哪一則」的計算，
 // 不碰渲染也不貼標記——分工線在那支的檔頭註解。目前只被量測模式用到。
@@ -9,6 +10,16 @@ import { fingerprintTurns, lengthsOfTurns, kindsOfTurns, alignDialogue, CONV_OVE
 
 // ESM 沒有 __dirname，自己算（快取讀數落檔要用——見 appendCacheLog）
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// 26-11-12：只有 Fable 5.2 需要新版；其餘模型保留 0.3.280 的送出內容。
+const NEEDS_NEW_SDK = ['claude-fable-5-2'];
+export function needsNewSdk(modelId) {
+  const id = String(modelId ?? '').replace(/\[1m\]$/i, '');
+  return NEEDS_NEW_SDK.some(prefix => id === prefix || id.startsWith(`${prefix}-`));
+}
+// 放在專用暫存目錄，避免從橋的父層找到 SillyTavern／擴充的 git repo。
+const SDK_NEXT_CWD = path.join(os.tmpdir(), 'tavern-claude-bridge', 'sdk-next-cwd');
+let nextSdkPromise;
 
 // 快取邊界標記（26-08-01 加）。
 // SDK 的 systemPrompt 除了字串還吃陣列，中間放這個標記＝**標記之前的區塊可以
@@ -498,6 +509,7 @@ const MODELS = [
   { id: 'claude-opus-4-6[1m]', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-opus-4-6', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-opus-4-8[1m]', object: 'model', owned_by: 'anthropic' },
+  { id: 'claude-fable-5-2', object: 'model', owned_by: 'anthropic' },   // 26-11-12：Fable 5.2
   { id: 'claude-fable-5-1', object: 'model', owned_by: 'anthropic' },   // 26-09-02 上線當天 Mini 點名加
   { id: 'claude-fable-5', object: 'model', owned_by: 'anthropic' },
   { id: 'claude-sonnet-5-5', object: 'model', owned_by: 'anthropic' },   // 26-09-29 發布當天 Mini 點名加（CLI 2.1.280 會印 unrecognized_model 但照送，實測回的是 claude-sonnet-5-5）
@@ -2141,7 +2153,7 @@ function readBody(req) {
 
 /** 送進 SDK query 的 options。兩條路徑唯一的差別是串流要 includePartialMessages。 */
 export function buildQueryOptions(modelId, systemPrompt, { stream, sysInFirstTurn = false } = {}) {
-  return {
+  const options = {
     // ③ 開關開：系統提示已放進 prompt 那則 user 的 content[0]，這裡**不傳**（SDK 的內建句仍在，那不歸我們管）。
     // 一處改、兩條路徑都生效——這正是 26-09-02 把 options 抽成一支的理由。
     systemPrompt: sysInFirstTurn ? undefined : systemPromptForSdk(systemPrompt),
@@ -2158,6 +2170,17 @@ export function buildQueryOptions(modelId, systemPrompt, { stream, sysInFirstTur
     ...thinkingOption(),
     ...effortOption(),
   };
+  if (needsNewSdk(modelId)) {
+    options.cwd = SDK_NEXT_CWD;
+    // 5.2 強制 adaptive；面板仍控制是否把摘要送回酒館，關閉時也不向上游索取摘要。
+    options.thinking = { type: 'adaptive', display: configThinking ? 'summarized' : 'omitted' };
+    // CLI 2.1.322 否則會把明確的 omitted 改成 updates（本機假上游已驗）。
+    options.env.CLAUDE_CODE_THINKING_DISPLAY_UPDATES = '0';
+    // 新 CLI 的預設變成 128k／medium，拉回舊橋對 5.2 的 32k／high；保留明確環境設定。
+    options.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS ||= '32000';
+    if (configEffort === 'auto' && !options.env.CLAUDE_CODE_EFFORT_LEVEL) options.effort = 'high';
+  }
+  return options;
 }
 
 /**
@@ -2568,6 +2591,19 @@ async function handleChatCompletions(req, res) {
     // 送出 SDK 之前酒館若已斷線（或被同一段聊天的新請求讓位），這裡再擋一次——SDK 一發都別燒
     if (ticket.aborted) return;
 
+    let requestQuery = queryFn;
+    if (needsNewSdk(modelId)) {
+      fs.mkdirSync(SDK_NEXT_CWD, { recursive: true });
+      // Promise 也快取：同時來的第一批 5.2 請求只載入一次，舊模型完全不載新版。
+      try {
+        nextSdkPromise ??= import('claude-agent-sdk-next');
+        requestQuery = (await nextSdkPromise).query;
+      } catch (err) {
+        throw new Error(`Fable 5.2 的新版 SDK 未載入，請在 plugins/tavern-claude-bridge/ 執行 npm install 後重啟。${err.message}`);
+      }
+      if (ticket.aborted) return;
+    }
+
     // 26-09-02（審核 A12，Mini 拍板 ⑧）：stream 缺省走 JSON——OpenAI 規範預設 stream=false。
     // 以前 `=== false` 才走 JSON，curl／第三方客戶端不帶 stream 會拿到一坨 data: 行。酒館永遠帶布林，不受影響。
     if (stream !== true) {
@@ -2577,7 +2613,7 @@ async function handleChatCompletions(req, res) {
         let absorbed = null;     // result 訊息收取結果（costUsd／resultUsage／resultModelUsage）；沒收到 result 就是 null
         const blockTypes = [];   // 這輪模型產出的 block 型別序列（空回覆診斷用）
         const diag = {};         // result 的 subtype/num_turns/is_error 與 stop_reason
-        const q = queryFn({ prompt: buildPrompt(), options: buildQueryOptions(modelId, systemPrompt, { stream: false, sysInFirstTurn: sysFirst }) });
+        const q = requestQuery({ prompt: buildPrompt(), options: buildQueryOptions(modelId, systemPrompt, { stream: false, sysInFirstTurn: sysFirst }) });
         ticket.q = q;
 
         for await (const msg of q) {
@@ -2681,7 +2717,7 @@ async function handleChatCompletions(req, res) {
     try {
       // 26-09-02（審核 A2）：queryFn 呼叫搬進 try。以前在 try 外——SSE 標頭已送出後它若同步拋錯，
       // 會跳到外層 catch，而外層只在 !headersSent 才回應：連線懸掛到酒館超時、終端機一個字都沒有。
-      const q = queryFn({ prompt: buildPrompt(), options: buildQueryOptions(modelId, systemPrompt, { stream: true, sysInFirstTurn: sysFirst }) });
+      const q = requestQuery({ prompt: buildPrompt(), options: buildQueryOptions(modelId, systemPrompt, { stream: true, sysInFirstTurn: sysFirst }) });
       ticket.q = q;
 
       let absorbed = null;     // result 訊息收取結果；沒收到 result 就是 null
@@ -2710,6 +2746,14 @@ async function handleChatCompletions(req, res) {
           }
         } else if (msg.type === 'result') {
           absorbed = absorbResult(msg, diag, requestCount + 1);
+          // 0.3.322 的 API 錯誤可能只有 result，沒有 text_delta；保留原文，別誤報額度／登入。
+          if (needsNewSdk(modelId) && msg.is_error && !sentText && resAlive()) {
+            const errorText = msg.result || msg.errors?.join('\n');
+            if (errorText) {
+              res.write(`data: ${JSON.stringify(makeChunk(completionId, modelId, { content: errorText }, null))}\n\n`);
+              sentText = true;
+            }
+          }
           break; // 串流輸入模式不會自己收尾，拿到 result 就走
         }
       }

@@ -2,6 +2,16 @@
 
 用你自己的 Claude 訂閱額度，在 SillyTavern 裡跟角色聊天。
 
+### v1.9.15：加入 Fable 5.2
+
+26-11-12 15:17 更新。模型清單新增 `claude-fable-5-2`，快取費用估算採官方每百萬 token 費率：輸入 US$8、輸出 US$40、1 小時快取寫入 US$16、讀取 US$0.20；最小可快取長度為 512 tokens。5 分鐘快取寫入費率為 US$10，橋沿用 1 小時設定。來源：[官方價格](https://platform.claude.com/docs/en/about-claude/pricing)、[快取門檻](https://platform.claude.com/docs/en/build-with-claude/prompt-caching#cache-limitations)。
+
+26-11-12 23:23 更新：**只有選 Fable 5.2 時，橋才會改用新版 SDK 0.3.322**；Opus 5.5、Fable 5.1 和其他模型繼續用 0.3.280，原本送出的內容不變。兩版會一起安裝，選模型就會自動切換。
+
+選 5.2 時，官方工具會在每則對話多附一段環境說明，以及「You are powered by the model named Fable 5.2…」這句模型身分說明，**目前關不掉**。橋已把新版的工作目錄移到專用空資料夾，減少附帶資訊；這些額外文字仍可能影響角色扮演。其他模型不受這次改動影響。
+
+狀態：本機副本 27 項測試通過，訂閱真打 Fable 5.2、Opus 5.5 各一發，都回「好」，尚未發版。下一步：交回整合審閱。版本紀錄見 [CHANGELOG](CHANGELOG.md)。在 `server/tavern-claude-bridge` 執行 `npm test` 會啟動實際 SDK／CLI，但只接本機假上游、使用假憑證，不會呼叫遠端模型。
+
 ---
 
 ## ⚠️ 使用前請讀
@@ -64,7 +74,7 @@ Claude Code 是 Anthropic 的官方命令列工具，你用 Claude 訂閱帳號�
 
 #### 方式 A：一鍵安裝（推薦）
 
-> 腳本開源，跑之前歡迎打開看它做什麼。全程在你電腦上跑，不連網下載任何東西。
+> 腳本開源，跑之前歡迎打開看它做什麼。腳本在你電腦上跑，`npm install` 會連網下載依賴套件，包括新舊兩版 SDK。
 
 1. 打開 PowerShell
 2. 用 `cd` 進到你的 SillyTavern 目錄（有 `server.js` 的那個資料夾）
@@ -105,7 +115,7 @@ Claude Code 是 Anthropic 的官方命令列工具，你用 Claude 訂閱帳號�
    ```
    cd "你的ST目錄路徑\plugins\tavern-claude-bridge"
    ```
-5. 執行：`npm install`
+5. 執行：`npm install`（會一起裝好 0.3.280 與 Fable 5.2 專用的 0.3.322）
 6. 用記事本打開 ST 目錄裡的 `config.yaml`，搜尋 `enableServerPlugins`，把後面的 `false` 改成 `true`：
 
    改之前：`enableServerPlugins: false`
@@ -120,6 +130,14 @@ Claude Code 是 Anthropic 的官方命令列工具，你用 Claude 訂閱帳號�
 [tavern-claude-bridge] Bridge running at http://127.0.0.1:5199
 [tavern-claude-bridge] Plugin initialized.
 ```
+
+### 已安裝的人怎麼更新
+
+1. 先到酒館擴充面板更新 Claude Bridge。
+2. 再跑一次上面的一鍵安裝指令。它會更新後台的 `package.json`／`package-lock.json`，重新跑 `npm install`，並確認兩版 SDK 都裝對。
+3. 關掉酒館再啟動，讓新的後台程式生效。
+
+手動更新也一樣：把新的 `server/tavern-claude-bridge/` 複製到 `plugins/tavern-claude-bridge/`，在目的地跑 `npm install`，再重啟酒館。**只更新前端擴充，不會更新後台或裝到第二份 SDK。**
 
 ### 第三步：在酒館裡連接
 
@@ -142,6 +160,7 @@ Claude Code 是 Anthropic 的官方命令列工具，你用 Claude 訂閱帳號�
 | `claude-opus-4-6[1m]` | Opus 4.6（1M context） |
 | `claude-opus-4-6` | Opus 4.6 |
 | `claude-opus-4-8[1m]` | Opus 4.8（1M context） |
+| `claude-fable-5-2` | Fable 5.2 |
 | `claude-fable-5-1` | Fable 5.1 |
 | `claude-fable-5` | Fable 5 |
 | `claude-sonnet-5-5` | Sonnet 5.5（v1.9.12 起） |
@@ -284,7 +303,7 @@ v1.2.0 之前這個是寫死開啟的、沒得選，上面那些症狀因此無�
 | High | high | 開著 |
 | Maximum | max | 開著 |
 
-**「Auto」是不指定思考量，不是關閉思考**——思維鏈照常運作，Claude Code 的預設是 high。同一列的 **Verbosity** 對本擴充無效（那是酒館給 OpenAI 模型用的）。
+**「Auto」不是關閉思考**。其他模型照舊交給原本的 SDK 決定；Fable 5.2 則維持舊橋的 high，避免換新版後自動降成 medium。若你有明確設定 `CLAUDE_CODE_EFFORT_LEVEL`，仍沿用那個設定。同一列的 **Verbosity** 對本擴充無效（那是酒館給 OpenAI 模型用的）。
 
 **選越高越耗額度**：模型想得越久，用掉的訂閱額度越多。
 

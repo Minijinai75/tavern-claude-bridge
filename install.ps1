@@ -124,7 +124,7 @@ $sourceDir = Join-Path $frontendDir "server\tavern-claude-bridge"
 # 26-08-03 的教訓：cache-breakpoint.mjs 被 index.mjs import 之後，這裡沒跟著加，
 # 安裝完會缺檔、橋直接起不來——而症狀是「裝好了但擴充面板說 plugin 沒啟用」，
 # 使用者完全看不出是少了一個檔。所以改成清單驅動，而且逐檔檢查、缺一個就停。
-$pluginFiles = @("index.mjs", "cache-breakpoint.mjs", "package.json")
+$pluginFiles = @("index.mjs", "cache-breakpoint.mjs", "package.json", "package-lock.json")
 
 foreach ($f in $pluginFiles) {
     if (-not (Test-Path (Join-Path $sourceDir $f))) {
@@ -168,42 +168,39 @@ Write-OK "Server plugin 已複製到 plugins\tavern-claude-bridge\"
 
 Write-Step 5 "安裝依賴套件"
 
-Write-Host "  正在安裝 SDK 和依賴套件，請稍等..."
+Write-Host "  正在安裝新舊兩版 SDK 和依賴套件，請稍等..."
 Push-Location $targetDir
 try {
     & npm install 2>&1 | Out-Null
+    $npmExitCode = $LASTEXITCODE
 } finally {
     Pop-Location
 }
 
-$sdkDir = Join-Path $targetDir "node_modules\@anthropic-ai\claude-agent-sdk"
-if (-not (Test-Path $sdkDir)) {
-    Write-Err "安裝不完整: 找不到 @anthropic-ai/claude-agent-sdk"
+if ($npmExitCode -ne 0) {
+    Write-Err "npm install 失敗 (結束碼 $npmExitCode)"
     Write-Host "    -> 打開 PowerShell，進到以下目錄手動跑 npm install 看看錯誤訊息:"
     Write-Host "    -> $targetDir"
     exit 1
 }
 
-$modulesDir = Join-Path $targetDir "node_modules"
-$pkgCount = 0
-if (Test-Path $modulesDir) {
-    $dirs = Get-ChildItem $modulesDir -Directory -ErrorAction SilentlyContinue
-    foreach ($d in $dirs) {
-        if ($d.Name.StartsWith('@')) {
-            $subDirs = Get-ChildItem $d.FullName -Directory -ErrorAction SilentlyContinue
-            if ($subDirs) { $pkgCount += @($subDirs).Count }
-        } else {
-            $pkgCount++
-        }
+$expectedSdks = [ordered]@{
+    "@anthropic-ai\claude-agent-sdk" = "0.3.280"
+    "claude-agent-sdk-next" = "0.3.322"
+}
+foreach ($sdkName in $expectedSdks.Keys) {
+    $sdkPackage = Join-Path $targetDir "node_modules\$sdkName\package.json"
+    $installedVersion = $null
+    try {
+        $installedVersion = (Get-Content -LiteralPath $sdkPackage -Raw -ErrorAction Stop | ConvertFrom-Json).version
+    } catch { }
+    if ($installedVersion -ne $expectedSdks[$sdkName]) {
+        Write-Err "安裝不完整: $sdkName 需要 $($expectedSdks[$sdkName])，目前是 '$installedVersion'"
+        Write-Host "    -> 到 $targetDir 手動跑 npm install 看看錯誤訊息"
+        exit 1
     }
 }
-
-if ($pkgCount -lt 50) {
-    Write-Warn "套件數偏低 ($pkgCount 個)，可能安裝不完整"
-    Write-Host "    -> 正常應該有 100 個以上。到 $targetDir 手動跑 npm install 試試"
-} else {
-    Write-OK "依賴套件安裝完成 ($pkgCount 個套件)"
-}
+Write-OK "兩版 SDK 安裝完成 (0.3.280 / Fable 5.2 專用 0.3.322)"
 
 # --- Step 6: config.yaml ---
 
